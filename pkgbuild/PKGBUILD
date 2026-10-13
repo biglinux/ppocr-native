@@ -1,0 +1,78 @@
+# Maintainer: Bruno Goncalves <bigbruno@gmail.com>
+# shellcheck shell=bash disable=SC2034,SC2154
+
+pkgname=ppocr-native
+pkgdesc="PP-OCRv6 text detection and recognition in plain Rust, the OCR engine of bigocrpdf"
+
+# Rolling package, versioned by build date like bigocrpdf.
+# makepkg sources this file again after the build; SOURCE_DATE_EPOCH, which it
+# fixes at start, keeps the date from moving between the build and the package.
+pkgver=$(date -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%y.%m.%d)
+pkgrel=$(date -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%H%M)
+# x86_64 picks its SIMD kernels at run time; aarch64 runs the plain Rust tier.
+arch=('x86_64' 'aarch64')
+url="https://github.com/biglinux/ppocr-native"
+# The plans are exported from PaddleOCR's models, which are Apache-2.0.
+license=('MIT OR Apache-2.0' 'BSD-3-Clause' 'BSL-1.0' 'Apache-2.0')
+depends=('glibc' 'libgcc')
+# The plans are exported here from the models RapidOCR packages, so they
+# always match those weights and the repository keeps no 31 MB of binaries.
+makedepends=(
+	'cargo'
+	'git'
+	'python'
+	'python-numpy'
+	'python-onnx'
+	'rapidocr-models-v6-small'
+)
+# objdump, for the instruction check in check()
+makedepends_x86_64=('binutils')
+
+source=("${pkgname}::git+${url}.git")
+sha256sums=('SKIP')
+
+_models=/usr/share/rapidocr/models
+
+prepare() {
+	cd "${srcdir}/${pkgname}" || return 1
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+	cd "${srcdir}/${pkgname}" || return 1
+	export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target CARGO_INCREMENTAL=0
+	cargo build --frozen --release --bin ppocr-native
+
+	mkdir -p plans
+	python -I tools/export_ocr.py "${_models}/PP-OCRv6_det_small.onnx" plans/PP-OCRv6_det_small.plan
+	python -I tools/export_ocr.py "${_models}/PP-OCRv6_rec_small.onnx" \
+		plans/PP-OCRv6_rec_small_argmax.plan --argmax
+	python -I tools/export_dictionary.py "${_models}/PP-OCRv6_rec_small.onnx" \
+		plans/PP-OCRv6_rec_small.characters.txt
+}
+
+check() {
+	cd "${srcdir}/${pkgname}" || return 1
+	export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target CARGO_INCREMENTAL=0
+	# With the exported plans, tests/worker.rs reads RapidOCR's text through the worker.
+	PPOCR_NATIVE_PLANS="${PWD}/plans" cargo test --frozen --release -- --include-ignored
+	# Kernels are chosen at run time: every tier must pass the same tests, and
+	# none may use another tier's instructions.
+	if [[ $CARCH == x86_64 ]]; then
+		local tier
+		for tier in 0 1 2; do
+			PPOCR_NATIVE_TIER=$tier PPOCR_NATIVE_PLANS="${PWD}/plans" \
+				cargo test --frozen --release -- --include-ignored
+		done
+		python -I tools/check_isa.py target/release/ppocr-native
+	fi
+}
+
+package() {
+	cd "${srcdir}/${pkgname}" || return 1
+	install -Dm755 target/release/ppocr-native -t "${pkgdir}/usr/bin"
+	install -Dm644 plans/PP-OCRv6_det_small.plan plans/PP-OCRv6_rec_small_argmax.plan \
+		plans/PP-OCRv6_rec_small.characters.txt -t "${pkgdir}/usr/share/ppocr-native"
+	install -Dm644 LICENSE-MIT LICENSE-APACHE NOTICE -t "${pkgdir}/usr/share/licenses/${pkgname}"
+}
