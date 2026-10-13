@@ -1,0 +1,183 @@
+ppocr-native
+Copyright 2026 Bruno Gonçalves <www.biglinux.com.br>
+
+This crate is a Rust implementation of PP-OCR's networks and of the image
+work around them, provided under MIT OR Apache-2.0. The parts named in
+sections 2 and 3 are translated from OpenCV and Clipper source code and keep
+those licences, reproduced at the end of this file. Everything else
+reproduces the results of the projects below, measured by running them and
+from their documentation, or is credited in sections 6 and 7. Preserve
+LICENSE-MIT, LICENSE-APACHE and this notice.
+
+1. RapidOCR (Apache-2.0), whose PP-OCR pipeline defines the steps, their
+   parameters and their order. https://github.com/RapidAI/RapidOCR
+
+2. OpenCV. https://opencv.org
+   resize, findContours, boxPoints, fillPoly and warpPerspective are
+   reproduced from their results. findContours implements S. Suzuki and
+   K. Abe, "Topological structural analysis of digitized binary images by
+   border following", Computer Vision, Graphics, and Image Processing
+   30(1), 1985.
+   Translated to Rust from OpenCV 4.x source and changed:
+   - src/geometry.rs, hull_order: the cyclic shift that convexHull applies
+     to its hull indices (modules/imgproc/src/convhull.cpp, notice A);
+   - src/geometry.rs, calipers: the rotating calipers of minAreaRect
+     (modules/imgproc/src/rotcalipers.cpp, notice B);
+   - src/crop.rs, cubic_weights: the INTER_CUBIC weights of
+     interpolateCubic (modules/imgproc/src/imgwarp.cpp, notice C).
+
+3. Clipper 6.4.2 by Angus Johnson, run through pyclipper 1.4.
+   http://www.angusj.com
+   src/geometry.rs, unclip: the round-joined corner offsets of
+   ClipperOffset (OffsetPoint, DoRound) are translated to Rust from
+   clipper.cpp and changed (notice D).
+
+4. numpy (BSD-3-Clause) and shapely/GEOS (BSD-3-Clause, LGPL-2.1): the order
+   of floating-point operations in normalisation, summation, area and length.
+
+5. PaddleOCR (Apache-2.0): the PP-OCR models. tests/fixtures/characters.txt
+   is the character list stored in the PP-OCRv6 small recogniser, and the
+   plans a package installs are exported from the PP-OCRv6 small models
+   RapidOCR distributes; both keep the models' licence.
+   https://github.com/PaddlePaddle/PaddleOCR
+   No model weights are included. tools/export_ocr.py converts model files
+   you obtain yourself; the plans it writes stay under the model's licence,
+   and whoever redistributes them carries that licence with them.
+
+6. Kernel family and SIMD tiering of src/engine/kernels.rs.
+   The register-blocked transposed matrix-vector kernel, the runtime tier
+   dispatch (AVX2+FMA / AVX / SSE4.1 / scalar) and the 64-byte weight
+   alignment derive from the BigLinux
+   `dpdfnet-native` package (MIT OR Apache-2.0), which derives them from
+   `deepfilternet-quantized-ladspa` (MIT OR Apache-2.0). That package
+   credits DeepFilterNet: Hendrik Schröter, Tobias Rosenkranz, Alberto N.
+   Escalante-B. and Andreas Maier (MIT OR Apache-2.0).
+   https://github.com/Rikorose/DeepFilterNet
+
+7. XNNPACK (BSD-3-Clause), by Facebook, Inc. and its affiliates and Google
+   LLC. The folded sigmoid and the exponential under the softmax, GELU and
+   swish compute as XNNPACK's f32-vsigmoid "p5-div" kernels do for finite
+   values: the same constants, argument reduction and order of operations,
+   written anew in Rust. https://github.com/google/XNNPACK
+
+
+A. OpenCV 4.x, modules/imgproc/src/convhull.cpp
+
+Copyright (C) 2000, Intel Corporation, all rights reserved.
+Third party copyrights are property of their respective owners.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+  * Redistribution's of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+
+  * Redistribution's in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+
+  * The name of Intel Corporation may not be used to endorse or promote products
+    derived from this software without specific prior written permission.
+
+This software is provided by the copyright holders and contributors "as is" and
+any express or implied warranties, including, but not limited to, the implied
+warranties of merchantability and fitness for a particular purpose are disclaimed.
+In no event shall the Intel Corporation or contributors be liable for any direct,
+indirect, incidental, special, exemplary, or consequential damages
+(including, but not limited to, procurement of substitute goods or services;
+loss of use, data, or profits; or business interruption) however caused
+and on any theory of liability, whether in contract, strict liability,
+or tort (including negligence or otherwise) arising in any way out of
+the use of this software, even if advised of the possibility of such damage.
+
+
+B. OpenCV 4.x, modules/imgproc/src/rotcalipers.cpp
+
+Copyright (C) 2000, Intel Corporation, all rights reserved.
+Third party copyrights are property of their respective owners.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+  * Redistribution's of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+
+  * Redistribution's in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+
+  * The name of OpenCV Foundation may not be used to endorse or promote products
+    derived from this software without specific prior written permission.
+
+This software is provided by the copyright holders and contributors "as is" and
+any express or implied warranties, including, but not limited to, the implied
+warranties of merchantability and fitness for a particular purpose are disclaimed.
+In no event shall the OpenCV Foundation or contributors be liable for any direct,
+indirect, incidental, special, exemplary, or consequential damages
+(including, but not limited to, procurement of substitute goods or services;
+loss of use, data, or profits; or business interruption) however caused
+and on any theory of liability, whether in contract, strict liability,
+or tort (including negligence or otherwise) arising in any way out of
+the use of this software, even if advised of the possibility of such damage.
+
+
+C. OpenCV 4.x, modules/imgproc/src/imgwarp.cpp
+
+Copyright (C) 2000-2008, Intel Corporation, all rights reserved.
+Copyright (C) 2009, Willow Garage Inc., all rights reserved.
+Copyright (C) 2014-2015, Itseez Inc., all rights reserved.
+Copyright (C) 2026, Advanced Micro Devices, all rights reserved.
+Third party copyrights are property of their respective owners.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+  * Redistribution's of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+
+  * Redistribution's in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+
+  * The name of the copyright holders may not be used to endorse or promote products
+    derived from this software without specific prior written permission.
+
+This software is provided by the copyright holders and contributors "as is" and
+any express or implied warranties, including, but not limited to, the implied
+warranties of merchantability and fitness for a particular purpose are disclaimed.
+In no event shall the Intel Corporation or contributors be liable for any direct,
+indirect, incidental, special, exemplary, or consequential damages
+(including, but not limited to, procurement of substitute goods or services;
+loss of use, data, or profits; or business interruption) however caused
+and on any theory of liability, whether in contract, strict liability,
+or tort (including negligence or otherwise) arising in any way out of
+the use of this software, even if advised of the possibility of such damage.
+
+
+D. Clipper 6.4.2, clipper.cpp
+
+Copyright: Angus Johnson 2010-2017
+
+Boost Software License - Version 1.0 - August 17th, 2003
+
+Permission is hereby granted, free of charge, to any person or organization
+obtaining a copy of the software and accompanying documentation covered by
+this license (the "Software") to use, reproduce, display, distribute,
+execute, and transmit the Software, and to prepare derivative works of the
+Software, and to permit third-parties to whom the Software is furnished to
+do so, all subject to the following:
+
+The copyright notices in the Software and this entire statement, including
+the above license grant, this restriction and the following disclaimer,
+must be included in all copies of the Software, in whole or in part, and
+all derivative works of the Software, unless such copies or derivative
+works are solely in the form of machine-executable object code generated by
+a source language processor.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
+SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE
+FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
