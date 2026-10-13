@@ -44,7 +44,7 @@ LICENSE-MIT, LICENSE-APACHE and this notice.
    you obtain yourself; the plans it writes stay under the model's licence,
    and whoever redistributes them carries that licence with them.
 
-6. Kernel family and SIMD tiering of src/engine/kernels.rs.
+6. Kernel family and SIMD tiering of src/engine/kernels/.
    The register-blocked transposed matrix-vector kernel, the runtime tier
    dispatch (AVX2+FMA / AVX / SSE4.1 / scalar) and the 64-byte weight
    alignment derive from the BigLinux

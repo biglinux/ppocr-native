@@ -25,7 +25,7 @@ const MEAN: [f64; 3] = [0.485, 0.456, 0.406];
 const STD: [f64; 3] = [0.229, 0.224, 0.225];
 
 /// Vertical lines, which `crop_text` turns a quarter: such a line scoring
-/// under `CONFIDENT_SCORE` is read again turned half a turn, and the new
+/// under `CONFIDENT_SCORE` is read again turned half a turn, and the second
 /// reading kept when it scores at least `MIN_SCORE_GAIN` more.
 const CONFIDENT_SCORE: f64 = 0.90;
 const MIN_SCORE_GAIN: f64 = 0.05;
