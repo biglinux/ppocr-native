@@ -7,12 +7,12 @@
 //! tie-breaking inside `minAreaRect` and its bicubic rounding, are bounded
 //! by what `tools/check_parity.py` measured on 30 full pages.
 
-mod common;
+mod npy;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::npy::{Npy, Result};
+use npy::{Npy, Result};
 use ppocr_native::{
     boxes_from_prob, crop_text, ctc_decode, ctc_decode_probs, det_input, det_size, find_contours,
     min_area_rect, pad_vertically, page_lines, prepare_page, rec_input, resize_linear, unclip,
@@ -32,7 +32,7 @@ fn fixtures() -> Result<Value> {
     ))?)?)
 }
 
-fn npy(name: &Value) -> Result<Npy> {
+fn array(name: &Value) -> Result<Npy> {
     Npy::read(&path(name.as_str().ok_or("file name")?))
 }
 
@@ -53,7 +53,7 @@ fn resize_matches_opencv() -> Result<()> {
             case["width"].as_u64().ok_or("w")? as usize,
             case["height"].as_u64().ok_or("h")? as usize,
         );
-        let expected = npy(&case["file"])?.image()?;
+        let expected = array(&case["file"])?.image()?;
         assert_eq!(
             resize_linear(&image, w, h),
             expected,
@@ -71,7 +71,7 @@ fn det_input_matches_rapidocr() -> Result<()> {
     let std: [f64; 3] = serde_json::from_value(f["det_input"]["std"].clone())?;
     let (w, h) = det_size(image.width, image.height, Limit::Max).ok_or("size")?;
     assert_eq!((w, h), (32, 32), "40x28 snaps to 32x32");
-    let expected = npy(&f["det_input"]["file"])?.f32s()?;
+    let expected = array(&f["det_input"]["file"])?.f32s()?;
     assert!(
         det_input(&image, w, h, mean, std) == expected,
         "detector tensor differs"
@@ -88,7 +88,7 @@ fn contours_match_opencv() -> Result<()> {
         .iter()
         .enumerate()
     {
-        let mask = npy(&case["file"])?;
+        let mask = array(&case["file"])?;
         let [h, w] = mask.shape[..] else {
             return Err("mask shape".into());
         };
@@ -107,7 +107,7 @@ fn contours_match_opencv() -> Result<()> {
 fn db_boxes_match_rapidocr() -> Result<()> {
     let f = fixtures()?;
     let case = &f["boxes"];
-    let prob = npy(&case["file"])?;
+    let prob = array(&case["file"])?;
     let [h, w] = prob.shape[..] else {
         return Err("map shape".into());
     };
@@ -156,7 +156,7 @@ fn crops_match_opencv() -> Result<()> {
     let f = fixtures()?;
     let page = Npy::read(&path("page.npy"))?.image()?;
     for case in f["crops"].as_array().ok_or("crops")? {
-        let expected = npy(&case["file"])?.image()?;
+        let expected = array(&case["file"])?.image()?;
         let got = crop_text(&page, &quad(&case["quad"]));
         assert_eq!(
             (got.width, got.height),
@@ -192,8 +192,8 @@ fn crops_match_opencv() -> Result<()> {
 fn rec_input_matches_rapidocr() -> Result<()> {
     let f = fixtures()?;
     for case in f["rec_input"].as_array().ok_or("cases")? {
-        let crop = npy(&case["crop"])?.image()?;
-        let expected = npy(&case["input"])?;
+        let crop = array(&case["crop"])?.image()?;
+        let expected = array(&case["input"])?;
         let (tensor, width) = rec_input(&crop);
         assert_eq!(
             width, expected.shape[3],

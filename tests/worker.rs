@@ -6,13 +6,13 @@
 //! expects is RapidOCR's, recorded by `tools/make_fixtures.py`.
 
 #[expect(dead_code, reason = "tests/parity.rs uses the rest of the helpers")]
-mod common;
+mod npy;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use common::npy::{Npy, Result};
+use npy::{Npy, Result};
 use ppocr_native::Image;
 use serde_json::{json, Value};
 

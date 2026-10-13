@@ -22,7 +22,7 @@ use ppocr_native::{
 };
 use serde_json::{json, Value};
 
-#[path = "../tests/common/npy.rs"]
+#[path = "../tests/npy/mod.rs"]
 mod npy;
 
 use npy::{Npy, Result};
