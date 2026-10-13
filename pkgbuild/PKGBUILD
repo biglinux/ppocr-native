@@ -9,8 +9,9 @@ pkgdesc="PP-OCRv6 text detection and recognition in plain Rust, the OCR engine o
 # fixes at start, keeps the date from moving between the build and the package.
 pkgver=$(date -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%y.%m.%d)
 pkgrel=$(date -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%H%M)
-# x86_64 picks its SIMD kernels at run time; aarch64 runs the plain Rust tier.
-arch=('x86_64' 'aarch64')
+# x86_64 only: the model weights it exports, rapidocr-models-v6-small, are
+# published for x86_64 alone. The code itself also builds for aarch64.
+arch=('x86_64')
 url="https://github.com/biglinux/ppocr-native"
 # The plans are exported from PaddleOCR's models, which are Apache-2.0.
 license=('MIT OR Apache-2.0' 'BSD-3-Clause' 'BSL-1.0' 'Apache-2.0')
