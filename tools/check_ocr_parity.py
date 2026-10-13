@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare a PP-OCRv6 plan with ONNX Runtime on RapidOCR's own input tensors.
 
-A directory holding `lines.jsonl` is recognizer input: every line runs at
+A directory holding `lines.jsonl` is recogniser input: every line runs at
 its own width in both engines, without padding, and the report gives the
 largest probability gap (of the best class, for an argmax plan), the
 per-timestep argmax agreement and CTC greedy text equality. One holding
@@ -10,7 +10,7 @@ report gives the largest probability-map gap and the share of pixels whose
 binarization at RapidOCR's threshold 0.3 differs. The engine runs at
 whatever tier `PPOCR_NATIVE_TIER` allows.
 
-The gates: a recognizer reads every line to the same text, agrees on at
+The gates: a recogniser reads every line to the same text, agrees on at
 least 99.9% of time steps and stays within 5e-3 in probability; a detector
 stays within 1e-3 in probability, with at most 1e-4 of any page's pixels
 binarized differently.

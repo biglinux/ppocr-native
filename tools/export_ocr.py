@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Export a PP-OCRv6 text recognizer or detector (ONNX, opset 11) to a plan.
+"""Export a PP-OCRv6 text recogniser or detector (ONNX, opset 11) to a plan.
 
 It pattern-matches the graphs RapidOCR ships as `PP-OCRv6_rec_small.onnx`
 and `PP-OCRv6_det_small.onnx` and refuses anything else; a model whose
-input height is fixed is the recognizer. The plan serves every input size:
-the graph is traced at a recognizer width of 320, RapidOCR's narrowest, or
+input height is fixed is the recogniser. The plan serves every input size:
+the graph is traced at a recogniser width of 320, RapidOCR's narrowest, or
 a 64-by-64 detector page, and the engine derives every other size from each
 window's padding and stride, the upsampling factors and `mean`, which
 covers the whole map whatever its size.
