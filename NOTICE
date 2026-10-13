@@ -18,6 +18,8 @@ LICENSE-MIT, LICENSE-APACHE and this notice.
    K. Abe, "Topological structural analysis of digitized binary images by
    border following", Computer Vision, Graphics, and Image Processing
    30(1), 1985.
+   OpenCV 4.5 and later is distributed under Apache-2.0; the translated
+   files keep their BSD-3-Clause headers, reproduced below.
    Translated to Rust from OpenCV 4.x source and changed:
    - src/geometry.rs, hull_order: the cyclic shift that convexHull applies
      to its hull indices (modules/imgproc/src/convhull.cpp, notice A);
