@@ -1,4 +1,6 @@
 /target
+# Plans are exported from the installed RapidOCR models and keep their
+# licence; see "Build from source" in README.md.
+/plans
 __pycache__/
 .ruff_cache/
-/plans
