@@ -57,7 +57,7 @@ pub fn decode(mut bytes: Vec<u8>) -> Result<Image, String> {
     if bytes.len() - start < len {
         return Err("truncated pixel data".into());
     }
-    let data = if channels == 3 {
+    let bgr = if channels == 3 {
         bytes.truncate(start + len);
         bytes.drain(..start);
         for px in bytes.as_chunks_mut::<3>().0 {
@@ -66,13 +66,13 @@ pub fn decode(mut bytes: Vec<u8>) -> Result<Image, String> {
         bytes
     } else {
         let bgr_len = pixels.checked_mul(3).ok_or("image too large")?;
-        let mut bgr = Vec::with_capacity(bgr_len);
+        let mut spread = Vec::with_capacity(bgr_len);
         for &v in &bytes[start..start + len] {
-            bgr.extend_from_slice(&[v, v, v]);
+            spread.extend_from_slice(&[v, v, v]);
         }
-        bgr
+        spread
     };
-    Ok(Image::new(width, height, data))
+    Ok(Image::new(width, height, bgr))
 }
 
 #[cfg(test)]
