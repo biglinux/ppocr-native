@@ -88,12 +88,13 @@ loads the detector alone. Plans are read from `PPOCR_NATIVE_PLANS`, by
 default `/usr/share/ppocr-native`, and checked before the ready line.
 `src/bin/ppocr-native/main.rs` lists every option.
 
-`--threads N` sets how many recognisers read a page's lines side by side,
-by default the CPUs the process may use; detection runs on one thread. On
-30 DharmaOCR pages on a Ryzen 7 5700U (8 cores, 16 threads, 35 W), one
-worker took 215 s on one thread, 95 s on four, 89 s on eight and 97 s on
-sixteen, with peak RSS rising from 461 MiB on one thread to 1639 MiB on
-sixteen; RapidOCR on OpenVINO with 16 threads took 137 s at 2451 MiB.
+`--threads N` sets how many threads the detector shares each page's layers
+between and how many recognisers read its lines side by side, by default
+the CPUs the process may use; any thread count gives the same bits. On 10
+pages of a book scanned at 300 dpi on a Ryzen 5 5600H (6 cores, 12
+threads), one worker took 60 s on one thread, 14.9 s on six and 14.6 s on
+twelve, with peak RSS rising from 477 MiB on one thread to 790 MiB on
+twelve; the detector alone took 8.4 s on one thread and 3.7 s on six.
 bigocrpdf runs one worker with a recogniser per physical core. A model keeps
 the tensors of a run in one block, each holding memory only from the step
 that writes it to the last that reads it; the detector alone peaks at
