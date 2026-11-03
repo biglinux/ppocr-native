@@ -108,6 +108,9 @@ fn live_columns(op: &Op, kx: usize) -> (usize, usize) {
 ///
 /// Either way a run of output rows is finished before the next begins, so the
 /// activation that follows reads it from the nearest cache.
+///
+/// `units` are the groups of [`rows_per_group`] rows of a pointwise layer, or
+/// the rows of a stem, to compute; `y` holds their output alone.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn convolve(
     op: &Op,
@@ -118,6 +121,7 @@ pub(super) fn convolve(
     tail: Tail,
     panels: bool,
     finished: &mut dyn FnMut(&[f32]),
+    units: std::ops::Range<usize>,
 ) {
     let (ci, co) = (op.ic, op.oc);
 
@@ -125,9 +129,11 @@ pub(super) fn convolve(
         // Unit stride keeps every row contiguous, so rows can be grouped.
         let rows = rows_per_group(op);
         let (clip, tail) = tail.fold_clip();
-        for first in (0..op.oh).step_by(rows) {
+        let base = units.start * rows * op.ow * co;
+        for group in units {
+            let first = group * rows;
             let pixels = rows.min(op.oh - first) * op.ow;
-            let (dst, src) = (first * op.ow * co, first * op.ow * ci);
+            let (dst, src) = (first * op.ow * co - base, first * op.ow * ci);
             let run = &mut y[dst..dst + pixels * co];
             let x = &x[src..src + pixels * ci];
             kernels::pointwise_with(run, w, x, bias, pixels, ci, co, panels, clip);
@@ -140,8 +146,8 @@ pub(super) fn convolve(
     let tap_len = ci * co;
     #[cfg(target_arch = "x86_64")]
     let tiled = kernels::simd_tier() >= 1;
-    for oy in 0..op.oh {
-        let out_row = oy * op.ow;
+    for oy in units.clone() {
+        let out_row = (oy - units.start) * op.ow;
         let mut interior = (0, 0);
         let top = (oy * op.sh) as isize - op.pt;
         if top >= 0 && top + op.kh as isize <= op.ih as isize {

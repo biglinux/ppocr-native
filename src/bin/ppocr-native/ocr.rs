@@ -55,20 +55,28 @@ pub struct Reader {
 
 impl Reader {
     /// Load the plans in `dir`, checking that they fit together: a
-    /// three-channel detector, and an argmax recogniser 48 pixels high whose
-    /// classes are the dictionary's.
-    pub fn load(dir: &Path, threads: usize, options: Options) -> Result<Self, String> {
+    /// three-channel detector, run on `det_threads` threads, and
+    /// `recognisers` argmax recognisers 48 pixels high whose classes are the
+    /// dictionary's.
+    pub fn load(
+        dir: &Path,
+        recognisers: usize,
+        det_threads: usize,
+        options: Options,
+    ) -> Result<Self, String> {
         let load = |name: &str| {
             let path = dir.join(name);
             Model::load(&path).map_err(|e| format!("{}: {e}", path.display()))
         };
-        let det = load(DET_PLAN)?;
+        let mut det = load(DET_PLAN)?;
         if det.input_shape().2 != 3 || det.output_count() != 1 {
             return Err(format!("{DET_PLAN}: not a text detector"));
         }
+        det.set_threads(det_threads)
+            .map_err(|e| format!("{}: {e}", dir.join(DET_PLAN).display()))?;
         let mut rec = Vec::new();
         let mut dictionary = Dictionary::from_metadata("");
-        if threads > 0 {
+        if recognisers > 0 {
             let path = dir.join(CHARACTERS);
             let text =
                 std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -84,7 +92,7 @@ impl Reader {
                     dictionary.len()
                 ));
             }
-            for _ in 1..threads {
+            for _ in 1..recognisers {
                 rec.push(first.try_clone().map_err(|e| e.to_string())?);
             }
             rec.insert(0, first);

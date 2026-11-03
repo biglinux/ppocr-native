@@ -53,6 +53,20 @@ pub(super) enum Step {
 }
 
 impl Step {
+    /// The channel mean this step sums as it goes, if any.
+    pub(super) fn mean(&self) -> Option<usize> {
+        match *self {
+            Step::Op { i, mean: true }
+            | Step::Chained {
+                conv: i,
+                mean: true,
+                ..
+            } => Some(i + 1),
+            Step::Fed { dw, mean: true } => Some(dw + 2),
+            _ => None,
+        }
+    }
+
     /// The operations this step runs.
     pub(super) fn ops(&self) -> Range<usize> {
         match *self {
@@ -623,8 +637,8 @@ mod tests {
     }
 
     /// Run `model` an operation at a time, its memory laid out for that,
-    /// then as scheduled, from the same input; asserts both leave every
-    /// output bit for bit the same and returns them.
+    /// then as scheduled, on one thread and on several, from the same input;
+    /// asserts all leave every output bit for bit the same and returns them.
     fn run_both_ways(model: &mut Model, label: &str) -> Vec<Vec<u32>> {
         let steps = std::mem::take(&mut model.steps);
         model.steps = (0..steps.last().map_or(0, |s| s.ops().end))
@@ -639,6 +653,13 @@ mod tests {
         fill(model);
         model.run();
         assert_eq!(results(model), one_by_one, "{label}");
+        for threads in [2, 3] {
+            model.set_threads(threads).unwrap();
+            fill(model);
+            model.run();
+            assert_eq!(results(model), one_by_one, "{label} on {threads} threads");
+        }
+        model.set_threads(1).unwrap();
         one_by_one
     }
 

@@ -25,8 +25,9 @@
 //! RapidOCR's CHW tensor first. Plans come from `tools/export_ocr.py`; one
 //! plan serves every input size, see [`Model::set_input_size`].
 //!
-//! One thread, one image at a time, 32-bit floats throughout: no thread
-//! pool, batching or quantisation.
+//! One image at a time, 32-bit floats throughout: no batching or
+//! quantisation. [`Model::set_threads`] shares each layer's rows between
+//! threads, giving the bits one thread gives.
 //!
 //! `plan.rs` reads and checks a plan; `schedule.rs` decides which operations
 //! run together and where each tensor lives; this file owns the memory and
@@ -41,10 +42,14 @@ mod plan;
 mod schedule;
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::any::Any;
 use std::ops::Range;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Condvar, Mutex, PoisonError};
+use std::thread;
 
 use conv::{
     add_with_tail, convolve, depthwise, maxpool, maxpool_in_place, opt, reads_windows,
@@ -146,7 +151,69 @@ impl View {
         // SAFETY: as for `get`; the caller promises this is the only view.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
+
+    /// Floats `start..start + len` alone, so that threads can hold views of
+    /// different parts of one buffer.
+    ///
+    /// # Safety
+    /// No mutable view of these floats may exist for the returned lifetime.
+    unsafe fn slice(&self, start: usize, len: usize) -> &[f32] {
+        assert!(start + len <= self.len, "view past its buffer");
+        // SAFETY: inside the view, as asserted; as for `get` otherwise.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(start), len) }
+    }
+
+    /// [`View::slice`], mutable.
+    ///
+    /// # Safety
+    /// No other view of these floats may exist for the returned lifetime.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn slice_mut(&self, start: usize, len: usize) -> &mut [f32] {
+        assert!(start + len <= self.len, "view past its buffer");
+        // SAFETY: inside the view, as asserted; as for `get_mut` otherwise.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(start), len) }
+    }
+
+    fn overlaps(&self, other: &View) -> bool {
+        let (a, b) = (self.ptr.as_ptr() as usize, other.ptr.as_ptr() as usize);
+        self.len > 0 && other.len > 0 && a < b + other.len * 4 && b < a + self.len * 4
+    }
 }
+
+/// The buffers one thread works in during a run.
+struct Work {
+    /// A group of rows of a private pair's convolution, see [`Pair`].
+    rows: Buffer,
+    /// A run of an expanded pair's widened pixels.
+    mid: Buffer,
+    /// A group of rows of a depthwise convolution feeding the layer after it.
+    fed: Buffer,
+    /// Scratch of the attention, CTC head, padded-window and transposed
+    /// convolution layers, and the gate of a gated step.
+    scratch: Buffer,
+}
+
+impl Work {
+    fn new() -> Self {
+        Self {
+            rows: Buffer::new(0),
+            mid: Buffer::new(0),
+            fed: Buffer::new(0),
+            scratch: Buffer::new(0),
+        }
+    }
+}
+
+/// A model the threads of one of its runs share.
+struct Shared<'a>(&'a Model);
+
+// SAFETY: while the units of a step run, each thread writes only its own
+// `Work`, and the units write disjoint parts of the step's outputs through
+// `View::slice_mut`, never a part another unit reads (`Model::units`). What
+// thread 0 does alone, a whole step or the gate copied into every thread's
+// `Work`, runs while the others wait at a barrier, and a barrier orders every
+// step after the one before it.
+unsafe impl Sync for Shared<'_> {}
 
 /// The weights: written once while loading, only read after, so models made
 /// with [`Model::try_clone`] share one copy across threads.
@@ -174,8 +241,9 @@ impl Weights {
 
 /// A loaded model with its scratch memory reserved.
 ///
-/// Running allocates nothing; changing the input size allocates only when a
-/// buffer has to grow.
+/// Running on one thread allocates nothing, and on several only starts the
+/// run's threads; changing the input size allocates only when a buffer has
+/// to grow.
 pub struct Model {
     plan: Plan,
     /// Held in cache-line-aligned storage, not a plain vector: the exporter
@@ -195,15 +263,11 @@ pub struct Model {
     panels: Vec<bool>,
     /// How a run goes through the operations, decided by `schedule`.
     steps: Vec<Step>,
-    /// A group of rows of a private pair's convolution, see [`Pair`].
-    rows: Buffer,
-    /// A run of an expanded pair's widened pixels.
-    mid: Buffer,
-    /// A group of rows of a depthwise convolution feeding the layer after it.
-    fed: Buffer,
-    /// Scratch of the attention, CTC head, padded-window and transposed
-    /// convolution layers, and the gate of a gated step.
-    scratch: Buffer,
+    /// The working buffers of each thread a run uses, one or more.
+    work: Vec<Work>,
+    /// Per step, the next unit a thread of the run takes; one per operation,
+    /// as many as steps there can be.
+    claims: Vec<AtomicUsize>,
 }
 
 // SAFETY: a `Model` owns its scratch buffers outright (nothing else holds a
@@ -233,22 +297,21 @@ impl Model {
         let mut model = Self {
             pool: vec![View::EMPTY; plan.pool.len()],
             layout: Placement::new(plan.pool.len()),
+            claims: (0..plan.ops.len()).map(|_| AtomicUsize::new(0)).collect(),
             plan,
             weights,
             arena: Buffer::new(0),
             panels,
             steps,
-            rows: Buffer::new(0),
-            mid: Buffer::new(0),
-            fed: Buffer::new(0),
-            scratch: Buffer::new(0),
+            work: vec![Work::new()],
         };
         model.schedule()?;
         Ok(model)
     }
 
     /// Another model sharing this one's weights, with scratch memory of its
-    /// own, at the same input size: a model per thread costs the weights once.
+    /// own, at the same input size and on as many threads: a model per thread
+    /// costs the weights once.
     pub fn try_clone(&self) -> Result<Self, Error> {
         let mut model = Self {
             plan: self.plan.clone(),
@@ -258,10 +321,10 @@ impl Model {
             layout: Placement::new(self.plan.pool.len()),
             panels: self.panels.clone(),
             steps: Vec::with_capacity(self.plan.ops.len()),
-            rows: Buffer::new(0),
-            mid: Buffer::new(0),
-            fed: Buffer::new(0),
-            scratch: Buffer::new(0),
+            work: self.work.iter().map(|_| Work::new()).collect(),
+            claims: (0..self.plan.ops.len())
+                .map(|_| AtomicUsize::new(0))
+                .collect(),
         };
         model.schedule()?;
         Ok(model)
@@ -330,16 +393,18 @@ impl Model {
             }
         }
         let arena = lay_out(plan, &self.steps, &mut self.layout);
-        let total = arena + rows + mid + fed + scratch;
+        let total = arena + self.work.len() * (rows + mid + fed + scratch);
         if total > MAX_SCRATCH_FLOATS {
             return Err(Error::Invalid(format!(
                 "scratch wants {total} floats, ceiling is {MAX_SCRATCH_FLOATS}"
             )));
         }
-        self.rows.reserve(rows)?;
-        self.mid.reserve(mid)?;
-        self.fed.reserve(fed)?;
-        self.scratch.reserve(scratch)?;
+        for work in &mut self.work {
+            work.rows.reserve(rows)?;
+            work.mid.reserve(mid)?;
+            work.fed.reserve(fed)?;
+            work.scratch.reserve(scratch)?;
+        }
         self.arena.reserve(arena)?;
         for (slot, view) in self.pool.iter_mut().enumerate() {
             *view = match self.layout.offset[slot] {
@@ -377,6 +442,21 @@ impl Model {
         Ok(())
     }
 
+    /// Split each following run between `threads` threads (one when 0),
+    /// each with working buffers of its own. A layer's rows are shared out
+    /// in the pieces one thread computes them in, so the result has the same
+    /// bits on any number of threads. On error the model keeps its threads.
+    pub fn set_threads(&mut self, threads: usize) -> Result<(), Error> {
+        let old = self.work.len();
+        self.work.resize_with(threads.max(1), Work::new);
+        if let Err(e) = self.arrange() {
+            // The threads kept still hold buffers of their old size.
+            self.work.truncate(old);
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Height, width and channel count of the image this model expects.
     pub fn input_shape(&self) -> (usize, usize, usize) {
         (self.plan.input.h, self.plan.input.w, self.plan.input.c)
@@ -394,17 +474,225 @@ impl Model {
         &mut buffer[..n]
     }
 
-    /// Run the network once over the image in [`Model::input_mut`].
+    /// Run the network once over the image in [`Model::input_mut`], on the
+    /// threads [`Model::set_threads`] gave it, or on one thread when the
+    /// system refuses to start them; the result is the same.
     pub fn run(&mut self) {
-        for step in &self.steps {
-            self.run_step(step);
+        if self.work.len() == 1 {
+            for step in &self.steps {
+                self.run_step(step, &self.work[0]);
+            }
+            return;
+        }
+        for claim in &mut self.claims {
+            *claim.get_mut() = 0;
+        }
+        let this: &Model = self;
+        let barrier = Barrier::new(this.work.len());
+        let failed = Mutex::new(None);
+        let shared = Shared(this);
+        // Whether every helper started, once known: no helper reaches the
+        // barrier, sized for all of them, before that.
+        let start = (Mutex::new(None), Condvar::new());
+        let (shared, barrier, failed, start) = (&shared, &barrier, &failed, &start);
+        thread::scope(|scope| {
+            let mut started = true;
+            for t in 1..this.work.len() {
+                let helper = thread::Builder::new().spawn_scoped(scope, move || {
+                    let (go, ready) = start;
+                    let mut go = go.lock().unwrap_or_else(PoisonError::into_inner);
+                    while go.is_none() {
+                        go = ready.wait(go).unwrap_or_else(PoisonError::into_inner);
+                    }
+                    if *go == Some(true) {
+                        drop(go);
+                        shared.0.share(t, barrier, failed);
+                    }
+                });
+                if helper.is_err() {
+                    started = false;
+                    break;
+                }
+            }
+            *start.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(started);
+            start.1.notify_all();
+            if started {
+                this.share(0, barrier, failed);
+            } else {
+                for step in &this.steps {
+                    this.run_step(step, &this.work[0]);
+                }
+            }
+        });
+        let panic = failed.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(panic) = panic {
+            resume_unwind(panic);
+        }
+    }
+
+    /// Thread `t`'s part of a run: every step in order, the ones
+    /// [`Model::units`] divides taken a unit at a time by whichever thread
+    /// is free, the others run by thread 0 alone, all threads meeting after
+    /// each step. A panic is kept for [`Model::run`] to raise once every
+    /// thread is through the steps, so that no thread waits at a meeting for
+    /// one that stopped.
+    fn share(&self, t: usize, barrier: &Barrier, failed: &Mutex<Option<Box<dyn Any + Send>>>) {
+        let work = &self.work[t];
+        let attempt = |job: &dyn Fn()| {
+            if failed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_some()
+            {
+                return;
+            }
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(job)) {
+                *failed.lock().unwrap_or_else(PoisonError::into_inner) = Some(panic);
+            }
+        };
+        for (step, claim) in self.steps.iter().zip(&self.claims) {
+            match self.units(step) {
+                Some(units) => {
+                    if let Step::Pair(ref pair) = *step {
+                        if pair.gate.is_some() {
+                            // The gate goes to every thread before any unit
+                            // can write over it.
+                            if t == 0 {
+                                attempt(&|| self.work.iter().for_each(|w| self.copy_gate(pair, w)));
+                            }
+                            barrier.wait();
+                        }
+                    }
+                    attempt(&|| loop {
+                        let unit = claim.fetch_add(1, Ordering::Relaxed);
+                        if unit >= units {
+                            break;
+                        }
+                        self.run_units(step, unit..unit + 1, work);
+                    });
+                    if step.mean().is_some() {
+                        barrier.wait();
+                        if t == 0 {
+                            attempt(&|| self.mean_after(step));
+                        }
+                    }
+                }
+                None if t == 0 => attempt(&|| self.run_step(step, work)),
+                None => {}
+            }
+            barrier.wait();
+        }
+    }
+
+    /// The units a step divides into, which may run on any thread in any
+    /// order and give the bits of the whole step: the rows or groups of rows
+    /// it computes one at a time. `None` for a step that runs whole on one
+    /// thread: one whose units would write what another unit reads, and the
+    /// pooling, element-wise and transposed steps, a small share of a run.
+    fn units(&self, step: &Step) -> Option<usize> {
+        let ops = &self.plan.ops;
+        match *step {
+            Step::Op { i, .. } | Step::Chained { conv: i, .. } => self.op_units(i),
+            Step::Pair(ref pair) => self
+                .pair_divides(pair)
+                .then(|| ops[pair.conv].oh.div_ceil(rows_per_group(&ops[pair.conv]))),
+            // `can_feed` keeps the convolution's output apart from the
+            // depthwise input its groups read through windows.
+            Step::Fed { dw, .. } => {
+                let conv = &ops[dw + 1];
+                Some(conv.oh.div_ceil(rows_per_group(conv)))
+            }
+            Step::GateAdd(_) | Step::Transposed(_) => None,
+        }
+    }
+
+    /// [`Model::units`] of operation `i`: the rows of a convolution, or the
+    /// groups of rows of a pointwise one. `Plan::check` and `lay_out` keep a
+    /// convolution's output apart from all it reads.
+    fn op_units(&self, i: usize) -> Option<usize> {
+        let op = &self.plan.ops[i];
+        match op.kind {
+            Kind::Conv if op.is_pointwise() => Some(op.oh.div_ceil(rows_per_group(op))),
+            Kind::Conv | Kind::Dwconv => Some(op.oh),
+            _ => None,
+        }
+    }
+
+    /// Whether `pair`'s groups can run apart: what one group writes is
+    /// read by no other. The pair may write over an input it reads pixel
+    /// by pixel when a pixel takes as many floats there as in the output,
+    /// so that each group writes over its own pixels alone.
+    fn pair_divides(&self, pair: &Pair) -> bool {
+        let ops = &self.plan.ops;
+        let (conv, add) = (&ops[pair.conv], &ops[pair.conv + 1]);
+        let in_work = |slot: usize| {
+            pair.gate.is_some_and(|g| slot == ops[g].y)
+                || pair.producer.is_some_and(|d| slot == ops[d].y)
+                || (pair.private && slot == conv.y)
+        };
+        // Inputs read pixel by pixel, with the floats a pixel takes there.
+        let pixels = [
+            pair.gate.map(|g| (ops[g].x, ops[g].oc)),
+            Some(
+                pair.expand
+                    .map_or((conv.x, conv.ic), |e| (ops[e].x, ops[e].ic)),
+            ),
+            Some((add.x, conv.oc)),
+            Some((add.x2, conv.oc)),
+        ];
+        // An input read through windows of neighbouring rows; the gate is
+        // copied before any group runs.
+        let whole = [pair.producer.map(|d| ops[d].x)];
+        let written = [Some(add.y), (!pair.private).then_some(conv.y)];
+        written.into_iter().flatten().all(|w| {
+            let out = &self.pool[w];
+            let by_pixel = pixels.into_iter().flatten().all(|(slot, c)| {
+                let input = &self.pool[slot];
+                in_work(slot) || !out.overlaps(input) || (out.ptr == input.ptr && c == conv.oc)
+            });
+            by_pixel
+                && whole
+                    .into_iter()
+                    .flatten()
+                    .all(|slot| !out.overlaps(&self.pool[slot]))
+        })
+    }
+
+    /// Units `units` of a step [`Model::units`] divides, on `work`.
+    fn run_units(&self, step: &Step, units: Range<usize>, work: &Work) {
+        match *step {
+            Step::Op { i, .. } => self.step(i, &Inputs::default(), units, work, &mut |_| {}),
+            Step::Chained {
+                conv, ref inputs, ..
+            } => self.step(conv, inputs, units, work, &mut |_| {}),
+            Step::Pair(ref pair) => self.row_pair(pair, units, work),
+            Step::Fed { dw, .. } => self.fed_pointwise(dw, units, work, None),
+            Step::GateAdd(_) | Step::Transposed(_) => {
+                unreachable!("a step that runs whole has no units")
+            }
+        }
+    }
+
+    /// The channel mean of a divided step, from its finished output: the
+    /// sums its units would have made one after another, pixel by pixel.
+    fn mean_after(&self, step: &Step) {
+        let Some(mean) = step.mean() else {
+            return;
+        };
+        let (op, mean) = (&self.plan.ops[mean - 1], &self.plan.ops[mean]);
+        let mut sums = layers::MeanSums::new(op.oc);
+        let pixels = op.oh * op.ow;
+        // SAFETY: the step is finished; the mean writes a buffer of its own.
+        unsafe {
+            sums.add(self.pool[op.y].slice(0, pixels * op.oc));
+            sums.finish(self.pool[mean.y].get_mut(), pixels);
         }
     }
 
     /// [`Model::run`], recording the time of each step in milliseconds of
     /// `clock`, with the operations it ran: one, or several that run
     /// together a part of the image at a time. A CPU-time clock keeps a
-    /// loaded host's descheduling out.
+    /// loaded host's descheduling out. It runs on one thread.
     ///
     /// `times` is cleared and refilled in plan order; the ranges index
     /// [`Model::ops`]. Reading the clock that often adds a little to the
@@ -418,40 +706,76 @@ impl Model {
         times.clear();
         for step in &self.steps {
             let started = clock();
-            self.run_step(step);
+            self.run_step(step, &self.work[0]);
             times.push((step.ops(), clock() - started));
         }
     }
 
-    fn run_step(&self, step: &Step) {
+    /// A whole step on one thread.
+    fn run_step(&self, step: &Step, work: &Work) {
         match *step {
-            Step::Op { i, mean } => self.alone(i, &Inputs::default(), mean),
+            Step::Op { i, mean } => self.alone(i, &Inputs::default(), mean, work),
             Step::Chained {
                 conv,
                 ref inputs,
                 mean,
                 ..
-            } => self.alone(conv, inputs, mean),
-            Step::Pair(ref pair) => self.row_pair(pair),
-            Step::Fed { dw, mean } => self.fed_pointwise(dw, mean),
-            Step::GateAdd(i) => self.gate_add(&self.plan.ops[i], &self.plan.ops[i + 1]),
-            Step::Transposed(i) => self.transposed_pair(i),
+            } => self.alone(conv, inputs, mean, work),
+            Step::Pair(ref pair) => {
+                let conv = &self.plan.ops[pair.conv];
+                self.copy_gate(pair, work);
+                self.row_pair(pair, 0..conv.oh.div_ceil(rows_per_group(conv)), work);
+            }
+            Step::Fed { dw, mean } => {
+                let conv = &self.plan.ops[dw + 1];
+                let mut sums = layers::MeanSums::new(if mean { conv.oc } else { 0 });
+                let groups = conv.oh.div_ceil(rows_per_group(conv));
+                self.fed_pointwise(dw, 0..groups, work, mean.then_some(&mut sums));
+                if mean {
+                    // SAFETY: the mean writes a buffer of its own.
+                    sums.finish(
+                        unsafe { self.pool[self.plan.ops[dw + 2].y].get_mut() },
+                        conv.oh * conv.ow,
+                    );
+                }
+            }
+            Step::GateAdd(i) => self.gate_add(&self.plan.ops[i], &self.plan.ops[i + 1], work),
+            Step::Transposed(i) => self.transposed_pair(i, work),
         }
     }
 
     /// Operation `i`, a windowed convolution reading `inputs` if they name
     /// any; with `mean`, the channel mean after it summed as `i` writes.
-    fn alone(&self, i: usize, inputs: &Inputs, mean: bool) {
+    fn alone(&self, i: usize, inputs: &Inputs, mean: bool, work: &Work) {
+        // Every unit of a convolution; `step` runs any other operation whole
+        // and reads no units for it.
+        let units = 0..self.op_units(i).unwrap_or(1);
         if !mean {
-            self.step(i, inputs, &mut |_| {});
+            self.step(i, inputs, units, work, &mut |_| {});
             return;
         }
         let (op, mean) = (&self.plan.ops[i], &self.plan.ops[i + 1]);
         let mut sums = layers::MeanSums::new(op.oc);
-        self.step(i, inputs, &mut |rows| sums.add(rows));
+        self.step(i, inputs, units, work, &mut |rows| sums.add(rows));
         // SAFETY: the mean writes a buffer of its own; its input, the
         // layer's output, is complete once `step` returns.
         sums.finish(unsafe { self.pool[mean.y].get_mut() }, op.oh * op.ow);
+    }
+
+    /// Copy the gate of `pair`, if it has one, into `work`'s scratch after
+    /// the gated run ([`gated_run`]), for [`Model::row_pair`] to read: a layer
+    /// of the pair may write over the gate, which the multiply reads whole.
+    fn copy_gate(&self, pair: &Pair, work: &Work) {
+        if let Some(g) = pair.gate {
+            let (g, at) = (&self.plan.ops[g], gated_run(pair, &self.plan.ops));
+            // SAFETY: no other thread uses `work` meanwhile: it is the
+            // caller's own, or every thread waits at the barrier that follows
+            // thread 0's copy (`Model::share`). The pool is only read here.
+            unsafe {
+                work.scratch.get_mut()[at..at + g.oc]
+                    .copy_from_slice(self.pool[g.x2].slice(0, g.oc));
+            }
+        }
     }
 
     /// The pointwise convolution and residual add of `pair`, a group of rows
@@ -461,7 +785,7 @@ impl Model {
     /// a producer the depthwise convolution before the first of them, a
     /// group of rows at a time into `fed`. Every other output is written to
     /// its tensor, except a private convolution's.
-    fn row_pair(&self, pair: &Pair) {
+    fn row_pair(&self, pair: &Pair, units: Range<usize>, work: &Work) {
         let Pair {
             producer,
             gate,
@@ -482,25 +806,13 @@ impl Model {
         let weights = self.weights.get();
         let block = |b: Block| &weights[b.0..b.0 + b.1];
         let rows = rows_per_group(conv);
-        // The gated run goes at the start of `scratch` and the gate after
-        // it, copied: a layer of the pair may write over the gate, which the
-        // multiply read whole before it.
-        let gated = match (gate, expand) {
-            (Some(g), Some(e)) => expand_run(&ops[e]) * ops[g].oc,
-            _ => 0,
-        };
-        if let Some(g) = gate {
-            let g = &ops[g];
-            // SAFETY: `scratch` is an allocation of its own, the pool is only
-            // read here.
-            unsafe {
-                self.scratch.get_mut()[gated..gated + g.oc]
-                    .copy_from_slice(&self.pool[g.x2].get()[..g.oc]);
-            }
-        }
-        let groups = conv.oh.div_ceil(rows);
-        for group in 0..groups {
-            let group = if backwards { groups - 1 - group } else { group };
+        let gated = gated_run(pair, ops);
+        for unit in units.clone() {
+            let group = if backwards {
+                units.end - 1 - (unit - units.start)
+            } else {
+                unit
+            };
             let first = group * rows;
             let pixels = rows.min(conv.oh - first) * conv.ow;
             if let Some(d) = producer {
@@ -510,7 +822,7 @@ impl Model {
                 let (x, y) = unsafe {
                     (
                         self.pool[dw.x].get(),
-                        &mut self.fed.get_mut()[..pixels * dw.oc],
+                        &mut work.fed.get_mut()[..pixels * dw.oc],
                     )
                 };
                 let (w, b, tail) = (block(dw.w), opt(dw.b, weights), Tail::of(dw));
@@ -538,11 +850,11 @@ impl Model {
                 // writes while they are read (see each writer below).
                 let read = |slot: usize, c: usize| unsafe {
                     if gate.is_some_and(|g| slot == ops[g].y) {
-                        &self.scratch.get()[..count * c]
+                        &work.scratch.get()[..count * c]
                     } else if producer.is_some_and(|d| slot == ops[d].y) {
-                        &self.fed.get()[start * c..][..count * c]
+                        &work.fed.get()[start * c..][..count * c]
                     } else {
-                        &self.pool[slot].get()[pixel * c..][..count * c]
+                        self.pool[slot].slice(pixel * c, count * c)
                     }
                 };
                 if let Some(g) = gate {
@@ -550,7 +862,7 @@ impl Model {
                     let x = read(g.x, g.oc);
                     // SAFETY: `scratch` is an allocation of its own; the gate
                     // reads the pool or `fed`.
-                    let (y, gates) = unsafe { self.scratch.get_mut().split_at_mut(gated) };
+                    let (y, gates) = unsafe { work.scratch.get_mut().split_at_mut(gated) };
                     kernels::channel_mul(y, x, &gates[..g.oc], count, g.oc);
                 }
                 if let Some(i) = expand {
@@ -558,7 +870,7 @@ impl Model {
                     let x = read(e.x, e.ic);
                     // SAFETY: `mid` is an allocation of its own, written only
                     // here.
-                    let y = unsafe { &mut self.mid.get_mut()[..count * e.oc] };
+                    let y = unsafe { &mut work.mid.get_mut()[..count * e.oc] };
                     let (clip, tail) = Tail::of(e).fold_clip();
                     let (w, b) = (block(e.w), opt(e.b, weights));
                     kernels::pointwise_with(y, w, x, b, count, e.ic, e.oc, self.panels[i], clip);
@@ -568,7 +880,7 @@ impl Model {
                 {
                     let x = if expand.is_some() {
                         // SAFETY: `mid` is only read from here on.
-                        unsafe { &self.mid.get()[..count * conv.ic] }
+                        unsafe { &work.mid.get()[..count * conv.ic] }
                     } else {
                         read(conv.x, conv.ic)
                     };
@@ -577,9 +889,9 @@ impl Model {
                     // both views BEFORE the add can overwrite conv.x.
                     let y = unsafe {
                         if private {
-                            &mut self.rows.get_mut()[..n]
+                            &mut work.rows.get_mut()[..n]
                         } else {
-                            &mut self.pool[conv.y].get_mut()[dst..dst + n]
+                            self.pool[conv.y].slice_mut(dst, n)
                         }
                     };
                     let (clip, tail) = Tail::of(conv).fold_clip();
@@ -593,14 +905,14 @@ impl Model {
                     // convolution scope survives.
                     let input = |slot: usize| {
                         if private && slot == conv.y {
-                            unsafe { &self.rows.get()[..n] }
+                            unsafe { &work.rows.get()[..n] }
                         } else {
                             read(slot, conv.oc)
                         }
                     };
                     let (x, x2) = (input(add.x), input(add.x2));
                     // SAFETY: as above.
-                    let y = unsafe { &mut self.pool[add.y].get_mut()[dst..dst + n] };
+                    let y = unsafe { self.pool[add.y].slice_mut(dst, n) };
                     add_with_tail(y, x, x2, n, Tail::of(add));
                 }
             }
@@ -608,26 +920,32 @@ impl Model {
     }
 
     /// Depthwise convolution `i` a group of rows at a time into `fed`, each
-    /// group straight through the pointwise convolution after it, and with
-    /// `mean` that convolution's channel mean summed as it goes.
-    fn fed_pointwise(&self, i: usize, mean: bool) {
+    /// group straight through the pointwise convolution after it, for the
+    /// groups `units`; with `sums`, that convolution's output summed for its
+    /// channel mean as it goes.
+    fn fed_pointwise(
+        &self,
+        i: usize,
+        units: Range<usize>,
+        work: &Work,
+        mut sums: Option<&mut layers::MeanSums>,
+    ) {
         let ops = &self.plan.ops;
         let (dw, conv) = (&ops[i], &ops[i + 1]);
         let weights = self.weights.get();
         let block = |b: Block| &weights[b.0..b.0 + b.1];
-        let mut sums = layers::MeanSums::new(if mean { conv.oc } else { 0 });
         let rows = rows_per_group(conv);
         let (clip, tail) = Tail::of(conv).fold_clip();
-        for first in (0..conv.oh).step_by(rows) {
+        for group in units {
+            let first = group * rows;
             let pixels = rows.min(conv.oh - first) * conv.ow;
             // SAFETY: `fed` is an allocation of its own; `can_feed` keeps the
             // convolution's output apart from the depthwise input.
             let (x, fed, y) = unsafe {
                 (
                     self.pool[dw.x].get(),
-                    &mut self.fed.get_mut()[..pixels * dw.oc],
-                    &mut self.pool[conv.y].get_mut()[first * conv.ow * conv.oc..]
-                        [..pixels * conv.oc],
+                    &mut work.fed.get_mut()[..pixels * dw.oc],
+                    self.pool[conv.y].slice_mut(first * conv.ow * conv.oc, pixels * conv.oc),
                 )
             };
             let (w, b, dw_tail) = (block(dw.w), opt(dw.b, weights), Tail::of(dw));
@@ -654,21 +972,14 @@ impl Model {
                 clip,
             );
             tail.apply(y);
-            if mean {
+            if let Some(sums) = sums.as_deref_mut() {
                 sums.add(y);
             }
-        }
-        if mean {
-            // SAFETY: the mean writes a buffer of its own.
-            sums.finish(
-                unsafe { self.pool[ops[i + 2].y].get_mut() },
-                conv.oh * conv.ow,
-            );
         }
     }
 
     /// Transposed convolutions `i` and `i + 1`, row by row.
-    fn transposed_pair(&self, i: usize) {
+    fn transposed_pair(&self, i: usize, work: &Work) {
         let (first, second) = (&self.plan.ops[i], &self.plan.ops[i + 1]);
         // SAFETY: the first layer's input, the second's output and the
         // scratch are three buffers apart (`can_chain_transposed`).
@@ -676,7 +987,7 @@ impl Model {
             (
                 self.pool[first.x].get(),
                 self.pool[second.y].get_mut(),
-                self.scratch.get_mut(),
+                work.scratch.get_mut(),
             )
         };
         let weights = self.weights.get();
@@ -703,15 +1014,15 @@ impl Model {
     }
 
     /// A channel multiply and the add of its product to its input.
-    fn gate_add(&self, gate: &Op, add: &Op) {
+    fn gate_add(&self, gate: &Op, add: &Op, work: &Work) {
         // The add may write over the gate, which the multiply read whole
         // before it: work from a copy.
         // SAFETY: `scratch` is an allocation of its own, the pool is only
         // read, and the views end before the add's output is taken.
         let g = unsafe {
-            let g = &mut self.scratch.get_mut()[..gate.oc];
+            let g = &mut work.scratch.get_mut()[..gate.oc];
             g.copy_from_slice(&self.pool[gate.x2].get()[..gate.oc]);
-            &self.scratch.get()[..gate.oc]
+            &work.scratch.get()[..gate.oc]
         };
         let (clip, tail) = Tail::of(add).fold_clip();
         let bounds = clip.unwrap_or((f32::NEG_INFINITY, f32::INFINITY));
@@ -765,9 +1076,17 @@ impl Model {
     }
 
     /// Run operation `i`, a windowed convolution reading `inputs` if they
-    /// name any. A convolution hands `finished` each run of whole output
-    /// pixels once it is final, in order.
-    fn step(&self, i: usize, inputs: &Inputs, finished: &mut dyn FnMut(&[f32])) {
+    /// name any: the units `units` of a convolution ([`Model::op_units`]),
+    /// any other operation whole. A convolution hands `finished` each run of
+    /// whole output pixels once it is final, in order.
+    fn step(
+        &self,
+        i: usize,
+        inputs: &Inputs,
+        units: Range<usize>,
+        work: &Work,
+        finished: &mut dyn FnMut(&[f32]),
+    ) {
         let (op, panels) = (&self.plan.ops[i], self.panels[i]);
         if let Some(over) = self.written_over(op) {
             self.in_place(op, over);
@@ -776,15 +1095,19 @@ impl Model {
         // SAFETY: `Plan::check` proved that no operation writes a buffer it
         // also reads, and `lay_out` keeps the buffers apart in memory but
         // for the output written over an input, handled above; so the output
-        // view never overlaps an input view, and the caller holds `&mut
-        // self`, ruling out views from outside.
-        let (x, y) = unsafe { (self.pool[op.x].get(), self.pool[op.y].get_mut()) };
+        // view never overlaps an input view. A convolution takes the rows of
+        // its units alone, which no other unit touches (`Model::units`); any
+        // other operation runs whole on one thread.
+        let x = unsafe { self.pool[op.x].get() };
+        let out = &self.pool[op.y];
+        let y = || unsafe { out.get_mut() };
+        let len = op.ow * op.oc;
         let weights = self.weights.get();
         // SAFETY: as for `x`; `Plan::check` proved `x2` distinct from `y`.
         let x2 = || unsafe { self.pool[op.x2].get() };
-        // SAFETY: the scratch is its own allocation, used by no other view
+        // SAFETY: the scratch belongs to this thread, used by no other view
         // while one operation runs.
-        let scratch = || unsafe { self.scratch.get_mut() };
+        let scratch = || unsafe { work.scratch.get_mut() };
         let block = |b: Block| &weights[b.0..b.0 + b.1];
         let tail = Tail::of(op);
         match op.kind {
@@ -811,8 +1134,9 @@ impl Model {
                 let (clip, tail) = tail.fold_clip();
                 let zeros = &mut scratch()[..op.ic.max(op.n2)];
                 zeros.fill(0.0);
-                let len = op.ow * op.oc;
-                for (oy, row) in y[..op.oh * len].chunks_exact_mut(len).enumerate() {
+                for oy in units {
+                    // SAFETY: this unit's row alone, as above.
+                    let row = unsafe { out.slice_mut(oy * len, len) };
                     kernels::conv_row(row, &sources[..count], zeros, w, b, op, oy, clip);
                     tail.apply(row);
                     finished(row);
@@ -820,24 +1144,35 @@ impl Model {
             }
             Kind::Conv => {
                 let (w, b) = (block(op.w), opt(op.b, weights));
-                convolve(op, x, y, w, b, tail, panels, finished);
+                let rows = if op.is_pointwise() {
+                    rows_per_group(op)
+                } else {
+                    1
+                };
+                let first = units.start * rows;
+                let end = (units.end * rows).min(op.oh);
+                // SAFETY: the rows of this step's units alone, as above.
+                let y = unsafe { out.slice_mut(first * len, (end - first) * len) };
+                convolve(op, x, y, w, b, tail, panels, finished, units);
             }
             Kind::Dwconv => {
                 let (w, b) = (block(op.w), opt(op.b, weights));
-                depthwise(op, x, y, w, b, tail, finished, 0..op.oh);
+                // SAFETY: as above.
+                let y = unsafe { out.slice_mut(units.start * len, units.len() * len) };
+                depthwise(op, x, y, w, b, tail, finished, units);
             }
-            Kind::Add => add_with_tail(y, x, x2(), op.out_len(), tail),
+            Kind::Add => add_with_tail(y(), x, x2(), op.out_len(), tail),
             Kind::Channelmul => {
-                kernels::channel_mul(y, x, &x2()[..op.oc], op.oh * op.ow, op.oc);
+                kernels::channel_mul(y(), x, &x2()[..op.oc], op.oh * op.ow, op.oc);
             }
-            Kind::Maxpool => maxpool(op, x, y),
-            Kind::Avgpool => layers::average_pool(op, x, y),
-            Kind::Concatc => layers::concat_channels(op, x, x2(), y),
-            Kind::Layernorm => layers::layer_norm(op, x, y, block(op.w)),
-            Kind::Mean => layers::mean(op, x, y),
-            Kind::Attention => layers::attention(op, x, y, block(op.w)[0], scratch()),
-            Kind::Upsample => layers::upsample(op, x, y),
-            Kind::Upsampleadd => layers::upsample_add(op, x, x2(), y),
+            Kind::Maxpool => maxpool(op, x, y()),
+            Kind::Avgpool => layers::average_pool(op, x, y()),
+            Kind::Concatc => layers::concat_channels(op, x, x2(), y()),
+            Kind::Layernorm => layers::layer_norm(op, x, y(), block(op.w)),
+            Kind::Mean => layers::mean(op, x, y()),
+            Kind::Attention => layers::attention(op, x, y(), block(op.w)[0], scratch()),
+            Kind::Upsample => layers::upsample(op, x, y()),
+            Kind::Upsampleadd => layers::upsample_add(op, x, x2(), y()),
             Kind::Convtranspose => {
                 let (clip, tail) = tail.fold_clip();
                 let (w, bias) = (block(op.w), opt(op.b, weights));
@@ -848,13 +1183,13 @@ impl Model {
                     clip,
                     panels,
                 };
-                transposed.run(x, y, scratch(), &|out| tail.apply(out));
+                transposed.run(x, y(), scratch(), &|out| tail.apply(out));
             }
             Kind::Ctchead | Kind::Ctcargmax => {
                 let probs = op.kind == Kind::Ctchead;
                 let vocab = if probs { op.oc } else { op.n2 };
                 let (w, b) = (block(op.w), block(op.b));
-                layers::ctc_head(y, x, w, b, op.iw, op.ic, vocab, probs, scratch());
+                layers::ctc_head(y(), x, w, b, op.iw, op.ic, vocab, probs, scratch());
             }
         }
     }
@@ -880,13 +1215,27 @@ impl Model {
 
     /// Bytes of scratch memory reserved, not counting the weights.
     pub fn scratch_bytes(&self) -> usize {
-        (self.arena.len + self.rows.len + self.mid.len + self.fed.len + self.scratch.len) * 4
+        let work: usize = self
+            .work
+            .iter()
+            .map(|w| w.rows.len + w.mid.len + w.fed.len + w.scratch.len)
+            .sum();
+        (self.arena.len + work) * 4
     }
 
     /// The operations at the current input size, for callers that time or
     /// report them.
     pub fn ops(&self) -> &[Op] {
         &self.plan.ops
+    }
+}
+
+/// Where the gate of a gated pair goes in a thread's scratch: after the run
+/// of gated pixels the multiply writes there.
+fn gated_run(pair: &Pair, ops: &[Op]) -> usize {
+    match (pair.gate, pair.expand) {
+        (Some(g), Some(e)) => expand_run(&ops[e]) * ops[g].oc,
+        _ => 0,
     }
 }
 
@@ -1086,6 +1435,24 @@ mod tests {
         }
         model.run();
         model.output(0).iter().map(|v| v.to_bits()).collect()
+    }
+
+    #[test]
+    fn threads_match_one_thread() {
+        let check = |label: &str, make: &dyn Fn() -> Model| {
+            let model = make();
+            let divided = model.steps.iter().filter(|s| model.units(s).is_some());
+            assert!(divided.count() > 0, "{label}: no step is shared out");
+            let want = run(&mut make());
+            for threads in [2, 3, 8] {
+                let mut model = make();
+                model.set_threads(threads).unwrap();
+                assert_eq!(run(&mut model), want, "{label} on {threads} threads");
+            }
+        };
+        check("page 64x48", &|| page_model(64, 48));
+        check("page 40x8", &|| page_model(40, 8));
+        check("line 1001", &|| line_model(1001));
     }
 
     #[test]

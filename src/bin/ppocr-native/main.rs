@@ -25,8 +25,9 @@
 //! The worker exits when standard input closes.
 //!
 //! Options:
-//!   --threads N          recognisers working on a page's lines (default: the
-//!                        CPUs this process may use)
+//!   --threads N          threads the detector runs on, and recognisers working
+//!                        on a page's lines (default: the CPUs this process
+//!                        may use)
 //!   --detect-only        load the detector alone; only `detect` and
 //!                        `probmap` requests are answered
 //!   --box-thresh F       mean probability a box needs (0.5)
@@ -76,8 +77,8 @@ fn main() -> ExitCode {
     };
     let plans = std::env::var_os("PPOCR_NATIVE_PLANS")
         .map_or_else(|| PathBuf::from(DEFAULT_PLANS), PathBuf::from);
-    let threads = if args.detect_only { 0 } else { args.threads };
-    let loaded = Reader::load(&plans, threads, args.options);
+    let recognisers = if args.detect_only { 0 } else { args.threads };
+    let loaded = Reader::load(&plans, recognisers, args.threads, args.options);
     let result = match (loaded, args.persistent) {
         (Ok(mut reader), true) => serve(&mut reader),
         (Ok(mut reader), false) => {
