@@ -21,12 +21,16 @@ fn stripes(input: &mut [f32], phase: usize) {
     }
 }
 
-/// The largest difference between two outputs of the same length.
+/// The largest difference between two outputs of the same length, all of
+/// whose values must be finite.
 fn largest_gap(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     a.iter()
         .zip(b)
-        .map(|(x, y)| (x - y).abs())
+        .map(|(x, y)| {
+            assert!(x.is_finite() && y.is_finite(), "{x} against {y}");
+            (x - y).abs()
+        })
         .fold(0.0, f32::max)
 }
 
