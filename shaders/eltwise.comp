@@ -1,0 +1,38 @@
+#version 450
+// Elementwise layers, one output value per invocation, by `mode`: 0 x + x2,
+// 1 x times the gate x2 (one value per channel), 2 x upsampled by repeating
+// pixels sh by sw times, 3 that plus x2, 4 the channels of x then x2 (ic and
+// n2 of them), 5 x plus x times the gate, 6 mode 3 whose addend is mode 5 of
+// x2 and the gate g (a squeeze-and-excite residual folded in); then the
+// activation.
+layout(local_size_x = 64) in;
+#include "act.glsl"
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer X2 { float x2[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(std430, binding = 3) readonly buffer G { float gate[]; };
+layout(push_constant) uniform P {
+    int mode, n, iw, oc, ow, sh, sw, ic, n2, act;
+} p;
+
+void main() {
+    int g = invocation();
+    if (g >= p.n) return;
+    float v;
+    int ch = g % p.oc, pixel = g / p.oc;
+    if (p.mode == 0) {
+        v = x[g] + x2[g];
+    } else if (p.mode == 1) {
+        v = x[g] * x2[ch];
+    } else if (p.mode == 5) {
+        v = x[g] + x[g] * x2[ch];
+    } else if (p.mode == 4) {
+        v = ch < p.ic ? x[pixel * p.ic + ch] : x2[pixel * p.n2 + ch - p.ic];
+    } else {
+        int oy = pixel / p.ow, ox = pixel % p.ow;
+        v = x[((oy / p.sh) * p.iw + ox / p.sw) * p.oc + ch];
+        if (p.mode == 3) v = x2[g] + v;
+        if (p.mode == 6) v = (x2[g] + x2[g] * gate[ch]) + v;
+    }
+    y[g] = act(v, p.act);
+}

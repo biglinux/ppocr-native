@@ -33,10 +33,12 @@
 //! run together and where each tensor lives; this file owns the memory and
 //! runs the steps; `conv.rs` (convolution, pooling) and `layers.rs` (the
 //! rest) compute whole layers with the tiered SIMD code in `kernels/`.
+//! [`GpuModel`] (`gpu/`) runs the same plans on a Vulkan GPU.
 
 #[macro_use]
 mod kernels;
 mod conv;
+mod gpu;
 mod layers;
 mod plan;
 mod schedule;
@@ -55,6 +57,7 @@ use conv::{
     add_with_tail, convolve, depthwise, maxpool, maxpool_in_place, opt, reads_windows,
     rows_per_group, Tail,
 };
+pub use gpu::GpuModel;
 pub use kernels::simd_tier;
 pub use plan::{Block, Error, Fused, Kind, Op};
 use plan::{Plan, MAX_SCRATCH_FLOATS};
@@ -553,15 +556,25 @@ impl Model {
         for (step, claim) in self.steps.iter().zip(&self.claims) {
             match self.units(step) {
                 Some(units) => {
-                    if let Step::Pair(ref pair) = *step {
-                        if pair.gate.is_some() {
-                            // The gate goes to every thread before any unit
-                            // can write over it.
+                    // A gate goes to every thread before any unit can write
+                    // over it.
+                    match *step {
+                        Step::Pair(ref pair) if pair.gate.is_some() => {
                             if t == 0 {
                                 attempt(&|| self.work.iter().for_each(|w| self.copy_gate(pair, w)));
                             }
                             barrier.wait();
                         }
+                        Step::GateAdd(i) => {
+                            if t == 0 {
+                                let gate = &self.plan.ops[i];
+                                attempt(&|| {
+                                    self.work.iter().for_each(|w| self.copy_gate_add(gate, w))
+                                });
+                            }
+                            barrier.wait();
+                        }
+                        _ => {}
                     }
                     attempt(&|| loop {
                         let unit = claim.fetch_add(1, Ordering::Relaxed);
@@ -588,7 +601,7 @@ impl Model {
     /// order and give the bits of the whole step: the rows or groups of rows
     /// it computes one at a time. `None` for a step that runs whole on one
     /// thread: one whose units would write what another unit reads, and the
-    /// pooling, element-wise and transposed steps, a small share of a run.
+    /// pooling and element-wise steps, a small share of a run.
     fn units(&self, step: &Step) -> Option<usize> {
         let ops = &self.plan.ops;
         match *step {
@@ -602,7 +615,10 @@ impl Model {
                 let conv = &ops[dw + 1];
                 Some(conv.oh.div_ceil(rows_per_group(conv)))
             }
-            Step::GateAdd(_) | Step::Transposed(_) => None,
+            // A row of the channel multiply and add, or an input row of the
+            // first transposed convolution: each writes its own pixels.
+            Step::GateAdd(i) => Some(ops[i].oh),
+            Step::Transposed(i) => Some(ops[i].ih),
         }
     }
 
@@ -667,9 +683,10 @@ impl Model {
             } => self.step(conv, inputs, units, work, &mut |_| {}),
             Step::Pair(ref pair) => self.row_pair(pair, units, work),
             Step::Fed { dw, .. } => self.fed_pointwise(dw, units, work, None),
-            Step::GateAdd(_) | Step::Transposed(_) => {
-                unreachable!("a step that runs whole has no units")
+            Step::GateAdd(i) => {
+                self.gate_add(&self.plan.ops[i], &self.plan.ops[i + 1], units, work)
             }
+            Step::Transposed(i) => self.transposed_pair(i, units, work),
         }
     }
 
@@ -739,8 +756,12 @@ impl Model {
                     );
                 }
             }
-            Step::GateAdd(i) => self.gate_add(&self.plan.ops[i], &self.plan.ops[i + 1], work),
-            Step::Transposed(i) => self.transposed_pair(i, work),
+            Step::GateAdd(i) => {
+                let gate = &self.plan.ops[i];
+                self.copy_gate_add(gate, work);
+                self.gate_add(gate, &self.plan.ops[i + 1], 0..gate.oh, work);
+            }
+            Step::Transposed(i) => self.transposed_pair(i, 0..self.plan.ops[i].ih, work),
         }
     }
 
@@ -978,15 +999,18 @@ impl Model {
         }
     }
 
-    /// Transposed convolutions `i` and `i + 1`, row by row.
-    fn transposed_pair(&self, i: usize, work: &Work) {
+    /// Transposed convolutions `i` and `i + 1` over the first one's input
+    /// rows `inputs`, row by row.
+    fn transposed_pair(&self, i: usize, inputs: Range<usize>, work: &Work) {
         let (first, second) = (&self.plan.ops[i], &self.plan.ops[i + 1]);
+        let per_input = first.kh * second.kh * second.ow * second.oc;
         // SAFETY: the first layer's input, the second's output and the
-        // scratch are three buffers apart (`can_chain_transposed`).
+        // scratch are three buffers apart (`can_chain_transposed`); the
+        // output rows of `inputs` are theirs alone (`Model::units`).
         let (x, y, scratch) = unsafe {
             (
                 self.pool[first.x].get(),
-                self.pool[second.y].get_mut(),
+                self.pool[second.y].slice_mut(inputs.start * per_input, inputs.len() * per_input),
                 work.scratch.get_mut(),
             )
         };
@@ -1008,36 +1032,50 @@ impl Model {
             )
         };
         let ((a, tail_a), (b, tail_b)) = (layer(i), layer(i + 1));
-        a.run_into(&b, x, y, scratch, &|out| tail_a.apply(out), &|out| {
-            tail_b.apply(out)
-        });
+        a.run_into(
+            &b,
+            x,
+            y,
+            scratch,
+            inputs,
+            &|out| tail_a.apply(out),
+            &|out| tail_b.apply(out),
+        );
     }
 
-    /// A channel multiply and the add of its product to its input.
-    fn gate_add(&self, gate: &Op, add: &Op, work: &Work) {
-        // The add may write over the gate, which the multiply read whole
-        // before it: work from a copy.
-        // SAFETY: `scratch` is an allocation of its own, the pool is only
-        // read, and the views end before the add's output is taken.
-        let g = unsafe {
-            let g = &mut work.scratch.get_mut()[..gate.oc];
-            g.copy_from_slice(&self.pool[gate.x2].get()[..gate.oc]);
-            &work.scratch.get()[..gate.oc]
-        };
+    /// Copy the gate of the channel multiply `gate` into `work`'s scratch,
+    /// for [`Model::gate_add`]: the add may write over the gate, which every
+    /// row of the multiply reads.
+    fn copy_gate_add(&self, gate: &Op, work: &Work) {
+        // SAFETY: no other thread uses `work` meanwhile: it is the caller's
+        // own, or every thread waits at the barrier that follows thread 0's
+        // copy (`Model::share`). The pool is only read here.
+        unsafe {
+            work.scratch.get_mut()[..gate.oc].copy_from_slice(&self.pool[gate.x2].get()[..gate.oc]);
+        }
+    }
+
+    /// Rows `rows` of a channel multiply and the add of its product to its
+    /// input, with the gate [`Model::copy_gate_add`] left in `work`.
+    fn gate_add(&self, gate: &Op, add: &Op, rows: Range<usize>, work: &Work) {
+        // SAFETY: the copy is only read from here on.
+        let g = unsafe { &work.scratch.get()[..gate.oc] };
         let (clip, tail) = Tail::of(add).fold_clip();
         let bounds = clip.unwrap_or((f32::NEG_INFINITY, f32::INFINITY));
-        let pixels = gate.oh * gate.ow;
+        let pixels = rows.len() * gate.ow;
+        let (start, n) = (rows.start * gate.ow * gate.oc, pixels * gate.oc);
         // SAFETY: the add's output has the multiply's input's memory, or
-        // memory apart from both its inputs, live at the same step.
-        let y = unsafe { self.pool[add.y].get_mut() };
+        // memory apart from both its inputs, live at the same step; each
+        // pixel reads only itself, so the rows of `rows` are theirs alone.
+        let y = unsafe { self.pool[add.y].slice_mut(start, n) };
         if self.pool[add.y].ptr == self.pool[gate.x].ptr {
             kernels::gate_add_in_place(y, g, pixels, gate.oc, bounds);
         } else {
             // SAFETY: as above.
-            let x = unsafe { self.pool[gate.x].get() };
+            let x = unsafe { self.pool[gate.x].slice(start, n) };
             kernels::gate_add(y, x, g, pixels, gate.oc, bounds);
         }
-        tail.apply(&mut y[..pixels * gate.oc]);
+        tail.apply(y);
     }
 
     /// The input whose memory `lay_out` gave `op`'s output, which `op`

@@ -1,0 +1,26 @@
+#version 450
+// Transposed convolution whose kh-by-kw windows do not overlap: output pixel
+// (kh iy + ky, kw ix + kx) is input pixel (iy, ix) times w[ic][ky][kx][oc],
+// plus the bias of tap (ky, kx); then the activation.
+layout(local_size_x = 64) in;
+#include "act.glsl"
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform P {
+    int iw, ic, oh, ow, oc, kh, kw, w_off, b_off, act;
+} p;
+
+void main() {
+    int g = invocation();
+    if (g >= p.oh * p.ow * p.oc) return;
+    int o = g % p.oc, pixel = g / p.oc;
+    int oy = pixel / p.ow, ox = pixel % p.ow;
+    int tap = (oy % p.kh) * p.kw + ox % p.kw;
+    int at = ((oy / p.kh) * p.iw + ox / p.kw) * p.ic;
+    int block = p.kh * p.kw * p.oc;
+    float acc = 0.0;
+    for (int i = 0; i < p.ic; i++) acc += w[p.w_off + i * block + tap * p.oc + o] * x[at + i];
+    if (p.b_off >= 0) acc += w[p.b_off + tap * p.oc + o];
+    y[g] = act(acc, p.act);
+}

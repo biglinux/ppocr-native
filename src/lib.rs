@@ -52,7 +52,7 @@ use std::cmp::Ordering;
 mod contour;
 mod crop;
 mod det;
-#[allow(unsafe_code)] // SIMD kernels and scratch views; see each SAFETY comment
+#[allow(unsafe_code)] // SIMD kernels, scratch views and the Vulkan FFI; see each SAFETY comment
 pub mod engine;
 mod geometry;
 mod image;
@@ -61,9 +61,9 @@ mod rec;
 pub use contour::{contour_mean, find_contours};
 pub use crop::{crop_text, VERTICAL_ASPECT_RATIO};
 pub use det::{
-    boxes_from_prob, contour_candidate, det_input, det_size, fit_page, order_and_clip,
-    pad_vertically, prepare_page, sort_boxes, Candidate, DbOptions, Limit, PageOptions,
-    PreparedPage,
+    boxes_from_prob, contour_candidate, det_input, det_input_hwc, det_size, fit_page,
+    order_and_clip, pad_vertically, prepare_page, sort_boxes, Candidate, DbOptions, Limit,
+    PageOptions, PreparedPage,
 };
 pub use geometry::{min_area_rect, mini_box, unclip, Quad, RotatedRect};
 pub use image::{resize_linear, rotate_ccw, Image};

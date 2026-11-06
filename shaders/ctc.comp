@@ -1,0 +1,49 @@
+#version 450
+// The CTC head's choice over each pixel's `vocab` logits (a row of `stride`):
+// the first class with the largest logit, as a float, and its softmax
+// probability. A workgroup per pixel, each invocation keeping a running
+// maximum, sum and best class over its columns, merged in shared memory.
+layout(local_size_x = 256) in;
+#include "act.glsl"
+layout(std430, binding = 0) readonly buffer L { float logits[]; };
+layout(std430, binding = 1) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform P { int vocab, stride; } p;
+shared float tops[256], sums[256], bests[256];
+
+void main() {
+    int px = int(gl_WorkGroupID.x), t = int(gl_LocalInvocationID.x);
+    int at = px * p.stride;
+    float none = uintBitsToFloat(0xff800000u);
+    float top = none, sum = 0.0, best = 3.0e38;
+    for (int col = t; col < p.vocab; col += 256) {
+        float logit = logits[at + col];
+        if (logit > top) {
+            sum = sum * exp_neg(top - logit) + 1.0;
+            top = logit;
+            best = float(col);
+        } else {
+            sum += exp_neg(logit - top);
+        }
+    }
+    tops[t] = top;
+    sums[t] = sum;
+    bests[t] = best;
+    barrier();
+    for (int half_ = 128; half_ > 0; half_ >>= 1) {
+        if (t < half_) {
+            float m1 = tops[t], m2 = tops[t + half_];
+            float m = max(m1, m2);
+            float s = (m1 == none ? 0.0 : sums[t] * exp_neg(m1 - m))
+                + (m2 == none ? 0.0 : sums[t + half_] * exp_neg(m2 - m));
+            float b = m1 > m2 ? bests[t] : (m2 > m1 ? bests[t + half_] : min(bests[t], bests[t + half_]));
+            tops[t] = m;
+            sums[t] = s;
+            bests[t] = b;
+        }
+        barrier();
+    }
+    if (t == 0) {
+        y[2 * px] = bests[0];
+        y[2 * px + 1] = 1.0 / sums[0];
+    }
+}

@@ -1,9 +1,11 @@
 //! Everything around the DB text detector: the page sizes it is fed, its input
 //! tensor, and the boxes read back from its probability map.
 
+use std::sync::{Mutex, PoisonError};
+
 use crate::contour::{contour_mean, find_contours};
 use crate::geometry::{mini_box, unclip, Quad};
-use crate::image::{resize_linear, Image};
+use crate::image::{resize_linear, resize_linear_rows, Image};
 
 /// Python's `int(round(x / 32) * 32)`: halves go to the even multiple, so 2000
 /// becomes 1984.
@@ -216,6 +218,76 @@ pub fn det_input(
     out
 }
 
+/// [`det_input`]'s values for `image` at `width` x `height`, written into
+/// `out` pixel by pixel, channels together, as the engine reads its input. A
+/// band of rows is resized and normalized on each of `threads` threads, and
+/// each channel's normalized value is computed once per byte value.
+///
+/// # Panics
+///
+/// When `out` holds fewer than `3 * width * height` values, or as
+/// [`resize_linear`] does.
+pub fn det_input_hwc(
+    image: &Image,
+    width: usize,
+    height: usize,
+    mean: [f64; 3],
+    std: [f64; 3],
+    threads: usize,
+    out: &mut [f32],
+) {
+    let scale = (1.0f64 / 255.0) as f32;
+    let table: [[f32; 256]; 3] = std::array::from_fn(|c| {
+        std::array::from_fn(|v| ((f64::from(v as f32 * scale) - mean[c]) / std[c]) as f32)
+    });
+    let row = width * 3;
+    let band = height.div_ceil(threads.max(1)) * row;
+    // Band `i` of the image, into `out`.
+    let fill = |i: usize, out: &mut [f32]| {
+        let first = i * band / row;
+        let mut bytes = vec![0; out.len()];
+        resize_linear_rows(
+            image,
+            width,
+            height,
+            first..first + out.len() / row,
+            &mut bytes,
+        );
+        for (out, px) in out
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .zip(bytes.as_chunks::<3>().0)
+        {
+            *out = std::array::from_fn(|c| table[c][usize::from(px[c])]);
+        }
+    };
+    let mut bands = out[..height * row].chunks_mut(band).enumerate();
+    let Some((_, first)) = bands.next() else {
+        return;
+    };
+    // The calling thread takes the first band, and any band whose thread
+    // the system refuses to start.
+    let bands: Vec<_> = bands.map(|(i, out)| (i, Mutex::new(Some(out)))).collect();
+    std::thread::scope(|scope| {
+        let fill = &fill;
+        for (i, out) in &bands {
+            let take = || out.lock().unwrap_or_else(PoisonError::into_inner).take();
+            let started = std::thread::Builder::new().spawn_scoped(scope, move || {
+                if let Some(out) = take() {
+                    fill(*i, out);
+                }
+            });
+            if started.is_err() {
+                if let Some(out) = take() {
+                    fill(*i, out);
+                }
+            }
+        }
+        fill(0, first);
+    });
+}
+
 /// The DB postprocess settings.
 #[derive(Clone, Copy, Debug)]
 pub struct DbOptions {
@@ -377,4 +449,29 @@ pub fn boxes_from_prob(
         .collect();
     sort_boxes(&mut boxes);
     boxes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hwc_input_is_det_input_transposed() {
+        let (w, h) = (23, 17);
+        let data = (0..w * h * 3).map(|i| (i * 37 % 251) as u8).collect();
+        let image = Image::new(w, h, data);
+        let (mean, std) = ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]);
+        let (ow, oh) = (32, 13);
+        let chw = det_input(&image, ow, oh, mean, std);
+        let plane = ow * oh;
+        let want: Vec<u32> = (0..3 * plane)
+            .map(|i| chw[(i % 3) * plane + i / 3].to_bits())
+            .collect();
+        for threads in [1, 2, 5, 13, 20] {
+            let mut hwc = vec![0.0; 3 * plane];
+            det_input_hwc(&image, ow, oh, mean, std, threads, &mut hwc);
+            let got: Vec<u32> = hwc.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(got, want, "{threads} threads");
+        }
+    }
 }

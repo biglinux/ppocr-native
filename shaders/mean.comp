@@ -1,0 +1,30 @@
+#version 450
+// Each channel's mean over every pixel, in two passes: with `pass` 0 a
+// workgroup sums its run of `chunk` pixels for every channel, one channel per
+// invocation, into partial sums; with `pass` 1 an invocation adds up one
+// channel's partial sums and divides.
+layout(local_size_x = 64) in;
+#include "act.glsl"
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) buffer S { float partial[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform P { int pass_, pixels, c, chunk; } p;
+
+void main() {
+    int chunks = (p.pixels + p.chunk - 1) / p.chunk;
+    if (p.pass_ == 0) {
+        int run = int(gl_WorkGroupID.y);
+        int ch = int(gl_WorkGroupID.x * 64 + gl_LocalInvocationID.x);
+        if (ch >= p.c) return;
+        int first = run * p.chunk, end = min(first + p.chunk, p.pixels);
+        float s = 0.0;
+        for (int px = first; px < end; px++) s += x[px * p.c + ch];
+        partial[run * p.c + ch] = s;
+    } else {
+        int ch = int(gl_GlobalInvocationID.x);
+        if (ch >= p.c) return;
+        float s = 0.0;
+        for (int run = 0; run < chunks; run++) s += partial[run * p.c + ch];
+        y[ch] = s / float(p.pixels);
+    }
+}

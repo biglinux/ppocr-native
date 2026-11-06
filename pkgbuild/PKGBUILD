@@ -16,6 +16,7 @@ url="https://github.com/biglinux/ppocr-native"
 # The plans are exported from PaddleOCR's models, which are Apache-2.0.
 license=('MIT OR Apache-2.0' 'BSD-3-Clause' 'BSL-1.0' 'Apache-2.0')
 depends=('glibc' 'libgcc')
+optdepends=('vulkan-icd-loader: the --gpu option')
 # The plans are exported here from the models RapidOCR packages, so they
 # always match those weights and the repository keeps no 31 MB of binaries.
 makedepends=(
@@ -25,6 +26,7 @@ makedepends=(
 	'python-numpy'
 	'python-onnx'
 	'rapidocr-models-v6-small'
+	'shaderc'
 )
 # objdump, for the instruction check in check()
 makedepends_x86_64=('binutils')
@@ -56,15 +58,16 @@ build() {
 check() {
 	cd "${srcdir}/${pkgname}" || return 1
 	export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target CARGO_INCREMENTAL=0
-	# With the exported plans, tests/worker.rs reads RapidOCR's text through the worker.
-	PPOCR_NATIVE_PLANS="${PWD}/plans" cargo test --frozen --release -- --include-ignored
+	# With the exported plans, tests/worker.rs reads RapidOCR's text through the
+	# worker. The GPU tests need a GPU, which a build machine need not have.
+	PPOCR_NATIVE_PLANS="${PWD}/plans" cargo test --frozen --release -- --include-ignored --skip gpu_
 	# Kernels are chosen at run time: every tier must pass the same tests, and
 	# none may use another tier's instructions.
 	if [[ $CARCH == x86_64 ]]; then
 		local tier
 		for tier in 0 1 2; do
 			PPOCR_NATIVE_TIER=$tier PPOCR_NATIVE_PLANS="${PWD}/plans" \
-				cargo test --frozen --release -- --include-ignored
+				cargo test --frozen --release -- --include-ignored --skip gpu_
 		done
 		python -I tools/check_isa.py target/release/ppocr-native
 	fi

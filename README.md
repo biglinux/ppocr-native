@@ -1,25 +1,138 @@
 # ppocr-native
 
-PP-OCRv6 text detection and recognition in plain Rust, giving the same
-results as RapidOCR with the settings bigocrpdf uses. It is bigocrpdf's OCR
+PP-OCRv6 text detection and recognition in plain Rust: the same text as
+RapidOCR, without Python, ONNX Runtime or OpenCV. It is bigocrpdf's OCR
 engine: a worker that reads page images and answers in JSON lines, and a
 library with every step in between.
 
-- **No dependencies.** The library and the worker use only `std`: no ONNX
-  Runtime, OpenCV, numpy, pyclipper or shapely.
-- **Its own inference engine.** Both networks run on the CPU from a plan
-  exported once from RapidOCR's ONNX files, with kernels chosen for the CPU
-  when the process starts. One plan serves every page and line size.
-- **The same arithmetic.** Each image step follows what RapidOCR 3.9
-  computes with OpenCV 5, numpy 2, pyclipper 1.4 and shapely 2, down to
-  OpenCV's fixed-point resize, its float32 rotating calipers, Clipper's arc
-  steps and numpy's pairwise summation.
+- No crates beyond Rust's standard library; `--gpu` opens the system's
+  `libvulkan.so.1` at run time.
+- Both networks run on our own engine, on the CPU or, with `--gpu`, on a
+  GPU with a Vulkan 1.2 driver (a software one such as llvmpipe doesn't
+  count).
+- Every image step reproduces RapidOCR's arithmetic, down to OpenCV's
+  fixed-point resize and numpy's pairwise sums.
 
-Build with `cargo build --release --locked`; check a change with
-`cargo test`, and with exported plans `PPOCR_NATIVE_PLANS=plans cargo test
---release -- --include-ignored` (see [Development](#development)).
+## How fast is it?
 
----
+Ten pages of a printer manual rendered at 300 dpi, 440 lines of text, read
+by the worker and by RapidOCR 3.9.2 configured the same way (PP-OCRv6 small,
+6 threads, median of 2 runs). RapidOCR runs on ONNX Runtime 1.31.1 or
+OpenVINO 2026.4.1, under Python 3.14.
+
+| | Laptop | Desktop |
+|---|---|---|
+| CPU | AMD Ryzen 5 5600H (6 cores, 12 threads) | Intel Core i5-13400 (6 performance + 4 efficient cores) |
+| RAM | 40 GB DDR4-3200 | 32 GB DDR5-5200 |
+| GPU | AMD Radeon Vega 7 (integrated) | NVIDIA GeForce GTX 1660 Ti, 6 GB |
+| Drivers | Mesa 26.2 (RADV) | NVIDIA 615.78 |
+| OS | BigLinux with BigDesktop, Linux 7.2 | BigLinux with BigDesktop, Linux 7.2 |
+
+### Laptop (Ryzen 5 5600H, Radeon Vega 7)
+
+| 10 pages | Time | CPU time | Memory |
+|---|---:|---:|---:|
+| ppocr-native, `--gpu` | **9.8 s** | 41 s | **388 MiB** |
+| ppocr-native, CPU | 13.0 s | 70 s | 506 MiB |
+| RapidOCR + OpenVINO | 21.8 s | 111 s | 2002 MiB |
+| RapidOCR + ONNX Runtime | 22.4 s | 129 s | 854 MiB |
+
+1.7 times faster than RapidOCR on the CPU alone, 2.2 times with the
+integrated GPU. OpenVINO matches ONNX Runtime's time and uses 2 GB for the
+privilege.
+
+### Desktop (Core i5-13400, GeForce GTX 1660 Ti)
+
+Pinned to one thread per performance core; RapidOCR was not measured on this
+machine.
+
+| 10 pages | Time | CPU time | Memory |
+|---|---:|---:|---:|
+| ppocr-native, `--gpu` | **5.0 s** | **5 s** | 440 MiB |
+| ppocr-native, CPU | 9.0 s | 48 s | 513 MiB |
+
+### Older machines
+
+| 10 pages | ppocr-native, CPU | ppocr-native, `--gpu` |
+|---|---:|---:|
+| Ryzen 7 5700U (8 threads), Radeon Vega 8 | 19.6 s | 14.7 s |
+| Core i3-2375M (Sandy Bridge, 4 threads, no Vulkan GPU) | 166 s | falls back to the CPU |
+
+### Install size and start-up
+
+| | ppocr-native | RapidOCR + ONNX Runtime | RapidOCR + OpenVINO |
+|---|---:|---:|---:|
+| Libraries | 1.4 MB, GPU support included | 370 MB of Python packages | 550 MB |
+| Models | 31 MB | 31 MB | 31 MB |
+| Ready to read, laptop | 0.07 s (0.13 s with `--gpu`) | 0.47 s | 0.67 s |
+
+The Python figures leave out Python itself.
+
+### Are the results the same?
+
+On the CPU, yes, within each instruction tier:
+
+- Every page step was checked against RapidOCR on 30 reference pages: page
+  limits, detector input, recogniser input, CTC decoding and line placement
+  match bit for bit. 1301 of 1310 boxes are identical; the other nine come
+  from near-ties inside OpenCV's `minAreaRect` and move an edge by a pixel
+  or two. 1184 of 1310 crops are identical, the rest one level off on 0.003%
+  of their pixels.
+- On the 10 pages above, all 440 lines read the same text as RapidOCR with a
+  recogniser batch of 1. Its default batch of 6 pads each line to the
+  widest in the batch, which changed 5 lines and made it slower, not faster
+  (37 s on the laptop).
+- Any thread count gives the same bytes, and so does any machine running the
+  same tier (AVX2+FMA, AVX, SSE4.1 or plain Rust); different tiers round a
+  few sums differently. Other architectures, aarch64 included, run plain
+  Rust.
+
+With `--gpu`, sums run in a different order: the detector's probabilities
+move by up to 4e-5 and scores by up to 1e-5. On the 10 pages, the boxes and
+the text were the same as on the CPU on all three GPUs above.
+
+## Why is it fast?
+
+### On the CPU
+
+- **Hand-written kernels** in AVX2+FMA, AVX, SSE4.1 and plain Rust, picked
+  at start-up (`PPOCR_NATIVE_TIER=N` forces an older one). The pointwise
+  tile does six pixels by sixteen channels, about 58 billion multiply-adds a
+  second on one Zen 3 core.
+- **No im2col.** Convolutions read their windows in place; the neck's
+  upsampling and channel concatenation are read by the convolution after
+  them instead of being written out.
+- **Fused layers.** Depthwise convolutions feed the pointwise ones a group of
+  rows at a time, squeeze-and-excite gates, activations and residual sums
+  are applied while the output is still in cache.
+- **Memory that comes and goes.** Each tensor holds memory only from the
+  step that writes it to the last that reads it.
+- **Deterministic threads.** Layers are split by rows, never inside a sum,
+  so 1 thread and 16 give the same bytes. The input is resized and
+  normalized on every thread too.
+- **No subnormal weights.** A tenth of the detector's weights are subnormal
+  floats, and recent Intel cores take a microcode assist for each product
+  with one, which makes the detector five times slower on an i5-13400. They
+  load as zero, and no sum notices.
+
+### On the GPU (Vulkan)
+
+- **Plain Vulkan compute shaders**, with `libvulkan.so.1` opened at run time.
+  No SDK, no CUDA, no ROCm; without a GPU the worker says so and uses the
+  CPU.
+- **32-bit floats.** Half floats ran 15% faster on the Vega 7 and moved 49 of
+  the 440 boxes, so they stayed out.
+- **Fused layers here too.** Convolutions take in the squeeze-and-excite
+  product before them, the residual sum after them and the neck's
+  upsampling and concatenation; a 7x7 depthwise kernel keeps its 49 weights
+  in registers.
+- **Different reads for different GPUs.** AMD GPUs read the shared tiles one
+  float at a time, which is faster on the Vega 7; the others read four at a
+  time, which is faster on the GTX 1660 Ti.
+- **CPU and GPU together.** A discrete GPU reads every line, sixteen at a
+  time, while the CPU crops the next ones. An integrated GPU shares the
+  memory and the power budget with the cores, so it reads 40% of each
+  page's line width and the cores read the rest.
 
 ## Install
 
@@ -34,10 +147,9 @@ character list in `/usr/share/ppocr-native`.
 
 ## Build from source
 
-The worker needs Rust 1.93 or later. The plans it runs are exported from
-the PP-OCRv6 small ONNX models RapidOCR distributes, which on BigLinux come
-in `rapidocr-models-v6-small` (installed in `/usr/share/rapidocr/models`).
-The export needs Python with onnx and numpy (`python-onnx`, `python-numpy`):
+You need Rust 1.93 or newer and `glslc` (from shaderc) for the shaders. The
+plans are exported from the PP-OCRv6 small ONNX models RapidOCR distributes
+(`rapidocr-models-v6-small` on BigLinux), with Python, onnx and numpy:
 
 ```bash
 cargo build --release --locked --bin ppocr-native
@@ -51,15 +163,12 @@ tools/export_dictionary.py $models/PP-OCRv6_rec_small.onnx plans/PP-OCRv6_rec_sm
 PPOCR_NATIVE_PLANS=plans target/release/ppocr-native page.ppm
 ```
 
-The repository keeps no plans or model files: they are 31 MB of binaries
-under the models' licence, and exporting them from the installed models
-keeps them matched to those weights. `pkgbuild/PKGBUILD` does the same
-steps.
-
-`--argmax` makes the recogniser output each time step's best class and its
-probability, which is what the worker reads, instead of the softmax over all
-18 710 classes. `src/engine/plan.rs` describes the plan format and checks
-every plan before anything runs.
+The repository keeps no model files: they are 31 MB under the models'
+licence, and exporting them from the installed models keeps them matched to
+those weights. `--argmax` makes the recogniser output each time step's best
+class and its probability instead of the softmax over all 18 710 classes.
+`src/engine/plan.rs` describes the plan format and checks every plan before
+anything runs. `pkgbuild/PKGBUILD` does all of the above.
 
 ## The worker
 
@@ -83,71 +192,30 @@ gets one answer line, until standard input closes:
 | `detect<TAB>PATH<TAB>MAX_SIDE` | `{"boxes": [...]}`, the detector's boxes alone on the page fitted within `MAX_SIDE` pixels |
 | `probmap<TAB>PATH<TAB>OUT` | `{"height": H, "width": W}`, after writing to `OUT` the detector's probability map of an image already at its input size, as little-endian `f32` rows |
 
-bigocrpdf uses the last two for dewarping, with `--detect-only`, which
-loads the detector alone. Plans are read from `PPOCR_NATIVE_PLANS`, by
-default `/usr/share/ppocr-native`, and checked before the ready line.
-`src/bin/ppocr-native/main.rs` lists every option.
+bigocrpdf uses the last two for dewarping, with `--detect-only`, which loads
+the detector alone. Plans are read from `PPOCR_NATIVE_PLANS`, by default
+`/usr/share/ppocr-native`, and checked before the ready line. `--threads N`
+sets how many threads the detector shares each page between and how many
+lines are read side by side, by default the CPUs the process may use.
+`--gpu` runs both networks on a Vulkan GPU. `src/bin/ppocr-native/main.rs`
+lists every option.
 
-`--threads N` sets how many threads the detector shares each page's layers
-between and how many recognisers read its lines side by side, by default
-the CPUs the process may use; any thread count gives the same bits. On 10
-pages of a book scanned at 300 dpi on a Ryzen 5 5600H (6 cores, 12
-threads), one worker took 60 s on one thread, 14.9 s on six and 14.6 s on
-twelve, with peak RSS rising from 477 MiB on one thread to 790 MiB on
-twelve; the detector alone took 8.4 s on one thread and 3.7 s on six.
-bigocrpdf runs one worker with a recogniser per physical core. A model keeps
-the tensors of a run in one block, each holding memory only from the step
-that writes it to the last that reads it; the detector alone peaks at
-27 MiB for a 480x448 input, 184 MiB at 1984x1344 and 1087 MiB at the
-4096x4096 limit.
-
-## CPU tiers
-
-x86_64 builds carry four sets of kernels and pick one when the process
-starts: AVX2 with FMA (tier 3), AVX (2), SSE4.1 (1) or plain Rust (0).
-`PPOCR_NATIVE_TIER=0..3` caps the tier, to run an older machine's code on a
-newer one. Results are bit-identical across runs and machines within a
-tier, not across tiers. Other architectures, aarch64 included, run tier 0.
-
-## What it covers
-
-PP-OCR reads a page with two networks: a DB detector that marks where text
-is, and a CTC recogniser that reads each line. Around them, the page is
-resized, the detector's probability map becomes boxes, each box is
-straightened into a crop, each crop becomes a recogniser input, and the
-recogniser's output becomes text and a score. Each of those steps is a
-public function, checked against RapidOCR on 30 pages:
-
-| Step | Function | Matches RapidOCR on 30 pages |
-|---|---|---|
-| Page limits (4096 px, 32-pixel multiples) | `prepare_page`, `fit_page` | bit for bit |
-| Detector input size and tensor | `det_size`, `det_input` | bit for bit |
-| Contours, rectangles, scores, unclip, filter, order | `boxes_from_prob` | 1301 of 1310 boxes identical, 1305 with IoU ≥ 0.99 |
-| Crop a box upright | `crop_text` | 1184 of 1310 crops identical, the rest one level off on 0.003 % of pixels |
-| Recogniser input | `rec_input` | bit for bit |
-| CTC decoding, text and score | `ctc_decode`, `ctc_decode_probs` | bit for bit |
-| Lines on the original page | `page_lines` | bit for bit |
-
-The nine boxes that differ, five of them below an IoU of 0.99, come from
-near-ties inside OpenCV's `minAreaRect` that it settles the other way (see
-`min_area_rect`); they move a box edge by a pixel or two. The crop
-differences are values whose bicubic sum sits next to a half. Outside the
-reference set the rates are alike: 863 of 866 boxes identical on 19 pages,
-and crop values one level off on 0.007 to 0.026 % of them depending on the
-content, never by more than one level. Run end to end with the recogniser
-on ONNX Runtime, 1290 of the 1295 lines read the same text; the other five
-are the lines whose box moved.
-
-Not covered: the detector's `fast` score mode (bigocrpdf uses `slow`),
-dilation, the text-line classifier and batches larger than one. Two kinds
-of thin page are answered differently from RapidOCR, to keep memory bounded:
-`prepare_page` refuses a page whose padded detector input would exceed
-4096² pixels, and the worker answers it as having no text; with
-`--full-resolution`, a page whose short side scaled up to 960 would pass
-that size is detected at the size used without the option. Re-reading
-vertical lines is the worker's, not the library's.
+Memory follows the page: the detector alone peaks at 27 MiB for a 480x448
+input, 184 MiB at 1984x1344 and 1087 MiB at the 4096x4096 limit.
 
 ## Using the library
+
+Each step of the pipeline is a public function:
+
+| Step | Function |
+|---|---|
+| Page limits (4096 px, 32-pixel multiples) | `prepare_page`, `fit_page` |
+| Detector input size and tensor | `det_size`, `det_input`, `det_input_hwc` |
+| Contours, rectangles, scores, unclip, filter, order | `boxes_from_prob` |
+| Crop a box upright | `crop_text` |
+| Recogniser input | `rec_input` |
+| CTC decoding, text and score | `ctc_decode`, `ctc_decode_probs` |
+| Lines on the original page | `page_lines` |
 
 ```rust,no_run
 use ppocr_native::{
@@ -184,9 +252,8 @@ fn read_page(
 
 The dictionary is the recogniser's `character` metadata, written by
 `tools/export_dictionary.py` and read by `Dictionary::from_metadata`.
-
-`engine::Model` runs a plan; the engine reads HWC tensors, so RapidOCR's CHW
-ones are transposed on the way in:
+`engine::Model` runs a plan on the CPU and `engine::GpuModel` on a GPU; both
+read HWC tensors, so RapidOCR's CHW ones are transposed on the way in:
 
 ```rust,no_run
 use ppocr_native::engine::{Error, Model};
@@ -204,125 +271,46 @@ fn recognise(rec: &mut Model, chw: &[f32], width: usize) -> Result<(Vec<u32>, Ve
 }
 ```
 
-## Where things live
+Not covered: the detector's `fast` score mode (bigocrpdf uses `slow`),
+dilation and the text-line classifier. Two kinds of thin page are answered
+differently from RapidOCR, to keep memory bounded: `prepare_page` refuses a
+page whose padded detector input would exceed 4096² pixels, and the worker
+answers it as having no text; with `--full-resolution`, a page whose short
+side scaled up to 960 would pass that size is detected at the size used
+without the option. Re-reading vertical lines is the worker's, not the
+library's.
 
-| Path | Holds |
-|---|---|
-| `src/*.rs` | the image and geometry steps of the table above |
-| `src/engine/mod.rs` | `Model`: memory, running the steps |
-| `src/engine/plan.rs` | the plan format, its validation and size rules |
-| `src/engine/schedule.rs` | which operations run together, and where each tensor lives |
-| `src/engine/conv.rs`, `layers.rs` | whole layers: convolution and pooling, then attention, CTC head, layer norm, upsampling, activations |
-| `src/engine/kernels/` | the tiered SIMD kernels, one file per family |
-| `src/bin/ppocr-native/` | the worker: protocol, page reading, PPM decoding |
-| `tools/export_ocr.py`, `export_dictionary.py` | ONNX to plan and character list |
-| `tools/`, `examples/` | parity checks, ISA check and benchmarks, below |
+## Repository layout
 
-## Development
+- `src/*.rs`: the image and geometry steps of the table above.
+- `src/engine/`: the inference engine. `plan.rs` is the plan format,
+  `schedule.rs` decides which operations run together and where each tensor
+  lives, `mod.rs` runs them, `conv.rs` and `layers.rs` compute whole layers
+  with the SIMD kernels in `kernels/`.
+- `src/engine/gpu/`, `shaders/`: `GpuModel`, the same plans on a Vulkan GPU.
+- `src/bin/ppocr-native/`: the worker.
+- `tools/`: plan and dictionary export, parity checks against RapidOCR, the
+  instruction check and benchmarks.
+
+## Testing
 
 ```bash
 cargo test
-```
-
-compares every step with fixtures written by `tools/make_fixtures.py` from
-OpenCV, pyclipper and RapidOCR themselves, 1.6 MB in all. With exported
-plans, the ignored tests in `tests/worker.rs` drive the worker through each
-request, check that it reads RapidOCR's text, and check that a thin strip
-under `--full-resolution` is answered without the oversized input:
-
-```bash
 PPOCR_NATIVE_PLANS=plans cargo test --release -- --include-ignored
-for tier in 0 1 2; do
-    PPOCR_NATIVE_TIER=$tier PPOCR_NATIVE_PLANS=plans cargo test --release -- --include-ignored
-done
-tools/check_isa.py target/release/ppocr-native
 ```
 
-The loop runs the same tests on each older tier's kernels, and
-`check_isa.py` confirms from the disassembly (`objdump`, in `binutils`)
-that each tier's kernels use only that tier's instructions. The package
-build runs all three. Lints: `cargo fmt --check`, `cargo clippy
---all-targets -- -D warnings`, and `ruff check tools` with `ruff format
---check tools`.
-
-On aarch64 the same tests pass on tier 0. Without the hardware, cross-build
-them and run them under qemu-user (`aarch64-linux-gnu-gcc`,
-`qemu-user-binfmt`; the binfmt handler lets `tests/worker.rs` start the
-worker):
-
-```bash
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-QEMU_LD_PREFIX=/usr/aarch64-linux-gnu PPOCR_NATIVE_PLANS=plans \
-cargo test --release --target aarch64-unknown-linux-gnu -- --include-ignored
-```
-
-### Parity with RapidOCR
-
-`make_fixtures.py`, `dump_reference.py`, `check_parity.py` and
-`check_ocr_parity.py` check the crate against the libraries it reproduces,
-so they need what the crate does not: RapidOCR with ONNX Runtime and the
-PP-OCRv6 small models (`python-rapidocr`, which brings OpenCV, pyclipper,
-shapely and the models, plus `python-onnxruntime-cpu`). Neither the build
-nor the worker uses them. The full comparison runs on a reference set
-recorded from RapidOCR:
-
-```bash
-tools/dump_reference.py MANIFEST IMAGE_DIR REF [--models DIR]
-cargo run --release --example parity_dump -- REF IMAGE_DIR characters.txt OUT
-tools/check_parity.py REF OUT --e2e PP-OCRv6_rec_small.onnx
-```
-
-Each step starts from the reference's own input to it, so a difference
-points at one step; `--e2e` also reads the crate's own crops with ONNX
-Runtime and compares the final lines. The crops are the one step that is
-not bit-identical: OpenCV 5 rounds a bicubic sum within a few thousandths of
-a half by its float32 evaluation order, which moves 3 in 100 000 values on
-the 30 reference pages, 14 in 100 000 on 19 others and 1 to 2 % on random
-noise.
-
-The networks are checked against ONNX Runtime on RapidOCR's own input
-tensors, at each tier:
-
-```bash
-PPOCR_NATIVE_TIER=2 tools/check_ocr_parity.py MODEL.onnx PLAN INPUT_DIR
-```
-
-It passes when every line reads the same text with at least 99.9 % of time
-steps agreeing, and every page's probability map stays within 1e-3 with at
-most 1e-4 of its pixels binarized differently.
-
-### Timing the engine
-
-The `plan` example runs or times a plan on RapidOCR's input tensors (CHW
-float32 files, a line `FILE` or a page `FILE:HxW`), and
-`tools/bench_ocr_abba.py` times two builds against each other on one CPU:
-
-```bash
-cargo build --release --example plan
-target/release/examples/plan PLAN run OUT.f32 INPUT...   # outputs, in order
-target/release/examples/plan PLAN bench INPUT RUNS       # CPU ms per run, JSON
-target/release/examples/plan PLAN profile INPUT RUNS     # time by kind of step
-tools/bench_ocr_abba.py --cpu 4 --input LINE.f32 --output bench.json \
-    --native old=old/plan:PLAN --native new=target/release/examples/plan:PLAN
-```
-
-The kernel choices in `src/engine/kernels/` were timed on an i3-2375M
-(Sandy Bridge, AVX, 256 KB L2) and an i5-13400. The pointwise tile's copy
-for exactly 16 outputs is 16 % faster for 8->16 channels on the first and
-12 % on the second. On the i3-2375M, the AVX tile of two pixels by 32
-outputs is 2 to 14 % faster than four by 16 while the weights fit in L2,
-and 8 to 11 % slower past it (112->672, 192->1152, 1152->192); the copy that
-spreads a pixel tile over L1 banks loses with two 16-column panels and pays
-from four; opaque pointers made per tile were 10 % slower than per-call
-offsets at 16 input channels. Blocking the dense convolution's taps to keep
-their weights in L1 moved layers by 2 % either way.
+The first compares every step with fixtures written from OpenCV, pyclipper
+and RapidOCR; the second also drives the worker, and checks that a GPU reads
+as the CPU does (`--skip gpu_` on a machine without one). Running the
+tests at each older tier, the instruction check, the parity tools and the
+benchmarks are in [docs/development.md](docs/development.md).
 
 ## License
 
 By Bruno Gonçalves ([BigLinux](https://www.biglinux.com.br)), licensed MIT
 OR Apache-2.0, at your option ([LICENSE-MIT](LICENSE-MIT),
 [LICENSE-APACHE](LICENSE-APACHE)). [NOTICE](NOTICE) names the projects whose
-behaviour this reproduces, and carries the licences of the OpenCV and
-Clipper code that parts of `src/geometry.rs` and `src/crop.rs` are adapted
-from. The plans the package installs are exported from PaddleOCR's models
-and keep their Apache-2.0 licence.
+behaviour this reproduces, and carries the licences of the OpenCV, Clipper
+and XNNPACK code that parts of the crate are adapted from. The plans the
+package installs are exported from PaddleOCR's models and keep their
+Apache-2.0 licence.

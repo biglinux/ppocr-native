@@ -76,12 +76,32 @@ fn taps(src: usize, dst: usize) -> Vec<Tap> {
 ///
 /// When either size of `image` or of the target is zero.
 pub fn resize_linear(image: &Image, width: usize, height: usize) -> Image {
+    let mut out = vec![0; width * height * 3];
+    resize_linear_rows(image, width, height, 0..height, &mut out);
+    Image::new(width, height, out)
+}
+
+/// Rows `band` of [`resize_linear`]'s result, into `out`: the same bytes,
+/// so bands of rows can be resized on several threads.
+///
+/// # Panics
+///
+/// When either size of `image` or of the target is zero, `band` ends past
+/// `height`, or `out` does not hold exactly those rows.
+pub(crate) fn resize_linear_rows(
+    image: &Image,
+    width: usize,
+    height: usize,
+    band: std::ops::Range<usize>,
+    out: &mut [u8],
+) {
     assert!(
         image.width > 0 && image.height > 0 && width > 0 && height > 0,
         "resize to or from an empty image"
     );
+    assert!(band.end <= height && out.len() == band.len() * width * 3);
     let xs = taps(image.width, width);
-    let ys = taps(image.height, height);
+    let ys = &taps(image.height, height)[band];
     let stride = image.width * 3;
     let horizontal = |row: usize, out: &mut [i32]| {
         let src = &image.data[row * stride..(row + 1) * stride];
@@ -98,8 +118,7 @@ pub fn resize_linear(image: &Image, width: usize, height: usize) -> Image {
         (usize::MAX, vec![0i32; width * 3]),
         (usize::MAX, vec![0i32; width * 3]),
     ];
-    let mut out = Vec::with_capacity(width * height * 3);
-    for tap in &ys {
+    for (tap, out) in ys.iter().zip(out.chunks_exact_mut(width * 3)) {
         for want in [tap.near, tap.far] {
             if rows[0].0 != want && rows[1].0 != want {
                 let slot = usize::from(rows[0].0 == tap.near || rows[0].0 == tap.far);
@@ -115,12 +134,11 @@ pub fn resize_linear(image: &Image, width: usize, height: usize) -> Image {
             }
         };
         let (top, bottom) = (pick(tap.near), pick(tap.far));
-        for (&a, &b) in top.iter().zip(bottom) {
+        for ((&a, &b), out) in top.iter().zip(bottom).zip(out.iter_mut()) {
             let v = (((a >> 4) * tap.near_weight) >> 16) + (((b >> 4) * tap.far_weight) >> 16);
-            out.push(((v + 2) >> 2).clamp(0, 255) as u8);
+            *out = ((v + 2) >> 2).clamp(0, 255) as u8;
         }
     }
-    Image::new(width, height, out)
 }
 
 /// `np.rot90`: a quarter turn counter-clockwise.
