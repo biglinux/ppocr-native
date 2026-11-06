@@ -813,7 +813,9 @@ fn shape_len(dims: &[usize]) -> Option<usize> {
 }
 
 /// Turn the raw weights into floats, rejecting a truncated block and any
-/// value that would poison every later result.
+/// value that would poison every later result. Subnormal weights become zero:
+/// a tenth of the detector's are, recent Intel cores take a microcode assist
+/// for every product with one, and none moves a sum.
 fn decode_weights(raw: &[u8]) -> Result<Vec<f32>> {
     if !raw.len().is_multiple_of(4) {
         return Err(Error::Invalid(format!(
@@ -823,7 +825,12 @@ fn decode_weights(raw: &[u8]) -> Result<Vec<f32>> {
     }
     let mut out = Vec::with_capacity(raw.len() / 4);
     for chunk in raw.as_chunks::<4>().0 {
-        out.push(f32::from_le_bytes(*chunk));
+        let v = f32::from_le_bytes(*chunk);
+        out.push(if v.is_subnormal() {
+            0.0f32.copysign(v)
+        } else {
+            v
+        });
     }
     if let Some(pos) = out.iter().position(|v| !v.is_finite()) {
         return Err(Error::Invalid(format!(
@@ -985,6 +992,17 @@ mod tests {
         for (what, bytes) in cases {
             assert!(Plan::parse(&bytes).is_err(), "{what} was accepted");
         }
+    }
+
+    #[test]
+    fn subnormal_weights_load_as_zero() {
+        let mut bytes = file(&[pointwise()], 20);
+        let end = bytes.len();
+        let tiny = -f32::from_bits(1);
+        bytes[end - 4..].copy_from_slice(&tiny.to_le_bytes());
+        let (_, weights) = Plan::parse(&bytes).unwrap();
+        let last = weights[weights.len() - 1];
+        assert_eq!((last, last.is_sign_negative()), (0.0, true));
     }
 
     #[test]
