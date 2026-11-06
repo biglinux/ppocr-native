@@ -431,7 +431,8 @@ const GPU_SHARE_INTEGRATED: f64 = 0.4;
 /// Read the lines of `boxes` in `order` on the GPU, up to `GPU_LINES` at a
 /// time, each a lane of its own: the same reads as one line at a time.
 /// `threads` threads crop the lines in order while the GPU reads the runs
-/// already cropped.
+/// already cropped, at most two runs ahead of it, so a dense page never
+/// holds more than that many inputs.
 fn recognise_on_gpu(
     model: &mut GpuModel,
     threads: usize,
@@ -441,13 +442,29 @@ fn recognise_on_gpu(
     order: &[usize],
 ) -> Result<Vec<(String, f64)>, String> {
     let next = AtomicUsize::new(0);
+    let batch = GPU_LINES.min(model.max_lanes());
     let (sent, received) = mpsc::channel();
+    // One credit per line a cropper may claim before the GPU has read it.
+    // Lines are claimed in order, so two runs of credits always cover the
+    // run the GPU waits for.
+    let (credit, credits) = mpsc::sync_channel(2 * batch);
+    for _ in 0..2 * batch {
+        credit.send(()).expect("the receiver is alive");
+    }
+    let credits = Mutex::new(credits);
     thread::scope(|scope| {
         // Dropped on return, which stops the croppers early after an error.
-        let received = received;
+        let (received, credit) = (received, credit);
         for _ in 0..threads.min(order.len()) {
-            let (sent, next) = (sent.clone(), &next);
+            let (sent, next, credits) = (sent.clone(), &next, &credits);
             scope.spawn(move || loop {
+                let taken = credits
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .recv();
+                if taken.is_err() {
+                    return;
+                }
                 let k = next.fetch_add(1, Ordering::Relaxed);
                 let Some(&i) = order.get(k) else {
                     return;
@@ -461,7 +478,6 @@ fn recognise_on_gpu(
         drop(sent);
         let mut cropped = vec![None; order.len()];
         let mut reads = vec![(String::new(), 0.0); boxes.len()];
-        let batch = GPU_LINES.min(model.max_lanes());
         for start in (0..order.len()).step_by(batch) {
             let run = start..(start + batch).min(order.len());
             while cropped[run.clone()].iter().any(Option::is_none) {
@@ -472,7 +488,7 @@ fn recognise_on_gpu(
                 };
                 cropped[k] = Some((i, input));
             }
-            let lines: Vec<(usize, (Vec<f32>, usize))> = cropped[run]
+            let lines: Vec<(usize, (Vec<f32>, usize))> = cropped[run.clone()]
                 .iter_mut()
                 .filter_map(|line| {
                     let (i, input) = line.take()?;
@@ -482,6 +498,10 @@ fn recognise_on_gpu(
             let tensors: Vec<_> = lines.iter().map(|(_, input)| input).collect();
             for ((i, _), read) in lines.iter().zip(read_on_gpu(model, dictionary, &tensors)?) {
                 reads[*i] = read;
+            }
+            for _ in run {
+                // The run's lines took these credits, so there is room.
+                credit.try_send(()).expect("a credit returned twice");
             }
         }
         Ok(reads)
