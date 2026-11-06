@@ -1,0 +1,205 @@
+#version 450
+// Dense convolution as an implicit matrix product: row m is output pixel m,
+// column n output channel n, and the reduction runs over the window's taps in
+// [kh][kw] order and in each tap the channels of x (ic) then of x2 (n2), zero
+// outside the image, matching weights [kh][kw][ic + n2][oc]. Up to two more
+// inputs, x3 and x4, follow with c3 and c4 channels, and input j may be 2^s_j
+// times smaller than the window's image along both axes, read as if upsampled
+// by repeating each pixel (nearest upsampling and channel concatenations
+// folded in). A workgroup computes a BM x BN tile (set when compiled) in steps
+// of BK of the reduction, both operands staged in shared memory; each
+// invocation keeps 4 x 4 sums. With `gated`, x's channels are first scaled by
+// the gate g (a squeeze-and-excite product folded in). Then the bias and the
+// activation, and with `residual` the sum with r and a second activation (an
+// addition folded in). With `panels` the weights are in panels of 16 columns,
+// [oc / 16][depth][16], as the CTC head's. With `spread_kw`, the product is a
+// transposed convolution whose windows do not overlap, its columns
+// [kh][spread_kw][spread_oc] taps of each input pixel: column n of row m goes
+// to its tap's output pixel.
+layout(local_size_x = 256) in;
+#include "act.glsl"
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer X2 { float x2[]; };
+layout(std430, binding = 2) readonly buffer W { float w[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+layout(std430, binding = 4) readonly buffer G { float g[]; };
+layout(std430, binding = 5) readonly buffer R { float r[]; };
+layout(std430, binding = 6) readonly buffer X3 { float x3[]; };
+layout(std430, binding = 7) readonly buffer X4 { float x4[]; };
+layout(push_constant) uniform P {
+    int ih, iw, ic, oh, ow, oc, kh, kw, sh, sw, pt, pl, n2, w_off, b_off, act;
+    int gated, residual, act2, panels, spread_kw, spread_oc, c3, c4, s1, s2, s3, s4;
+} p;
+
+// Pixel (iy, ix) of the window's image in an input 2^s times smaller.
+int pixel(int iy, int ix, int s) {
+    return (iy >> s) * (p.iw >> s) + (ix >> s);
+}
+
+const int TM = 4, TN = 4;
+// Eight values of the reduction a step: longer steps are slower on AMD and
+// NVIDIA alike (docs/development.md).
+const int BK = 8;
+const int ROWS = BM * BK / 256;
+#ifdef VEC4
+// Four rows (a) or columns (b) to a vector, so that an invocation reads its
+// four of each in one load; a's rows padded by one vector against bank
+// conflicts. Used where it is faster: not on AMD (docs/development.md).
+shared vec4 a[BK][BM / 4 + 1];
+shared vec4 b[BK][BN / 4];
+#define A_AT(k, m) a[k][(m) >> 2][(m) & 3]
+#define B_AT(k, n) b[k][(n) >> 2][(n) & 3]
+#else
+shared float a[BK][BM + 4];
+shared float b[BK][BN];
+#define A_AT(k, m) a[k][m]
+#define B_AT(k, n) b[k][n]
+#endif
+
+const int RB = (BK * BN + 255) / 256;
+
+// Step k0's operand values this invocation stages: channel `ch` of tap `tap`
+// for its rows of `a`, and its weights of `b`, at `wb[q] + k0 * wstep`. With
+// `pointwise`, row i of `a` is x[top[i] + ch]: a 1x1 product over one input
+// of the output's size, whose window and bounds never change.
+void load(int k0, int tap, int ch, int kk, int depth, bool pointwise, int top[ROWS],
+          int left[ROWS], int wb[RB], int wstep, out float ra[ROWS], out float rb[RB]) {
+    int t = int(gl_LocalInvocationID.x);
+    bool live = k0 + kk < depth;
+    for (int q = 0; q < RB; q++) {
+        int k = k0 + (t + 256 * q) / BN;
+        rb[q] = (wb[q] >= 0 && k < depth) ? w[wb[q] + k0 * wstep] : 0.0;
+    }
+    if (pointwise) {
+        for (int i = 0; i < ROWS; i++) {
+            float v = 0.0;
+            if (live) {
+                v = x[top[i] + ch];
+                if (p.gated != 0) v *= g[ch];
+            }
+            ra[i] = v;
+        }
+        return;
+    }
+    int ky = tap / p.kw, kx = tap - ky * p.kw;
+    for (int i = 0; i < ROWS; i++) {
+        int iy = top[i] + ky, ix = left[i] + kx;
+        float v = 0.0;
+        if (live && iy >= 0 && iy < p.ih && ix >= 0 && ix < p.iw) {
+            int c2 = p.ic + p.n2, c3 = c2 + p.c3;
+            if (ch < p.ic) {
+                v = x[pixel(iy, ix, p.s1) * p.ic + ch];
+                if (p.gated != 0) v *= g[ch];
+            } else if (ch < c2) {
+                v = x2[pixel(iy, ix, p.s2) * p.n2 + ch - p.ic];
+            } else if (ch < c3) {
+                v = x3[pixel(iy, ix, p.s3) * p.c3 + ch - c2];
+            } else {
+                v = x4[pixel(iy, ix, p.s4) * p.c4 + ch - c3];
+            }
+        }
+        ra[i] = v;
+    }
+}
+
+void main() {
+    int t = int(gl_LocalInvocationID.x);
+    int tiles_n = (p.oc + BN - 1) / BN;
+    int tile = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x);
+    int m0 = (tile / tiles_n) * BM, n0 = (tile % tiles_n) * BN;
+    int rows = p.oh * p.ow, c = p.ic + p.n2 + p.c3 + p.c4;
+    if (m0 >= rows) return;
+    // This invocation loads channel `kk` of rows t / BK + (256 / BK) i of
+    // `a`, and weights (bk, bn) of `b`.
+    int kk = t % BK, am = t / BK;
+    bool pointwise = p.kh == 1 && p.kw == 1 && p.sh == 1 && p.sw == 1 && p.pt == 0 && p.pl == 0
+        && p.n2 == 0 && p.c3 == 0 && p.c4 == 0 && p.s1 == 0 && p.oh == p.ih && p.ow == p.iw;
+    int top[ROWS], left[ROWS];
+    for (int i = 0; i < ROWS; i++) {
+        int m = min(m0 + am + (256 / BK) * i, rows - 1);
+        int oy = m / p.ow;
+        top[i] = pointwise ? m * p.ic : oy * p.sh - p.pt;
+        left[i] = (m - oy * p.ow) * p.sw - p.pl;
+    }
+    // Where this invocation's weights of `b` start, -1 past the matrix; each
+    // step moves them `wstep` floats per value of the reduction.
+    int depth = p.kh * p.kw * c;
+    int wb[RB];
+    for (int q = 0; q < RB; q++) {
+        int e = t + 256 * q;
+        int bk = e / BN, n = n0 + e - bk * BN;
+        int at = p.panels != 0 ? (n >> 4) * depth * 16 + bk * 16 + (n & 15) : bk * p.oc + n;
+        wb[q] = e < BK * BN && n < p.oc ? p.w_off + at : -1;
+    }
+    int wstep = p.panels != 0 ? 16 : p.oc;
+    int tx = t % (BN / TN), ty = t / (BN / TN);
+    float acc[TM][TN];
+    for (int i = 0; i < TM; i++) for (int j = 0; j < TN; j++) acc[i][j] = 0.0;
+    // The reduction in steps of BK: invocation t loads index k0 + kk, at tap
+    // `tap`, channel `ch`, counted on rather than divided out. The next
+    // step's values are loaded into registers before this step's products,
+    // so that their latency overlaps the arithmetic.
+    int tap = 0, ch = kk;
+    while (ch >= c) {
+        ch -= c;
+        tap++;
+    }
+    float ra[ROWS], rb[RB];
+    load(0, tap, ch, kk, depth, pointwise, top, left, wb, wstep, ra, rb);
+    for (int k0 = 0; k0 < depth; k0 += BK) {
+        for (int i = 0; i < ROWS; i++) A_AT(kk, am + (256 / BK) * i) = ra[i];
+        for (int q = 0; q < RB; q++) {
+            int e = t + 256 * q;
+            if (e < BK * BN) B_AT(e / BN, e % BN) = rb[q];
+        }
+        barrier();
+        ch += BK;
+        while (ch >= c) {
+            ch -= c;
+            tap++;
+        }
+        if (k0 + BK < depth) {
+            load(k0 + BK, tap, ch, kk, depth, pointwise, top, left, wb, wstep, ra, rb);
+        }
+        for (int k = 0; k < BK; k++) {
+#ifdef VEC4
+            vec4 av = a[k][ty], bv = b[k][tx];
+#else
+            float av[TM], bv[TN];
+            for (int i = 0; i < TM; i++) av[i] = a[k][ty + (BM / TM) * i];
+            for (int j = 0; j < TN; j++) bv[j] = b[k][tx + (BN / TN) * j];
+#endif
+            for (int i = 0; i < TM; i++) for (int j = 0; j < TN; j++) acc[i][j] += av[i] * bv[j];
+        }
+        barrier();
+    }
+    for (int i = 0; i < TM; i++) {
+#ifdef VEC4
+        int m = m0 + 4 * ty + i;
+#else
+        int m = m0 + ty + (BM / TM) * i;
+#endif
+        if (m >= rows) continue;
+        for (int j = 0; j < TN; j++) {
+#ifdef VEC4
+            int n = n0 + 4 * tx + j;
+#else
+            int n = n0 + tx + (BN / TN) * j;
+#endif
+            if (n >= p.oc) continue;
+            float v = acc[i][j];
+            if (p.b_off >= 0) v += w[p.b_off + n];
+            v = act(v, p.act);
+            if (p.residual != 0) v = act(v + r[m * p.oc + n], p.act2);
+            int at = m * p.oc + n;
+            if (p.spread_kw != 0) {
+                int tap = n / p.spread_oc, ky = tap / p.spread_kw, kx = tap - ky * p.spread_kw;
+                int iy = m / p.iw, ix = m - iy * p.iw;
+                int kh = p.oc / (p.spread_kw * p.spread_oc);
+                at = ((iy * kh + ky) * p.iw * p.spread_kw + ix * p.spread_kw + kx) * p.spread_oc
+                    + n - tap * p.spread_oc;
+            }
+            y[at] = v;
+        }
+    }
+}

@@ -1,0 +1,48 @@
+#version 450
+// A 7x7 depthwise convolution at stride 1, as dwconv.comp computes it, for a
+// block of OX x OY outputs of one channel per invocation: its 49 weights stay
+// in registers and each input pixel the block's windows share is read once.
+// Each output still sums its taps from the bias, row by row, in order.
+layout(local_size_x = 64) in;
+#include "act.glsl"
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform P {
+    int ih, iw, c, oh, ow, kh, kw, sh, sw, pt, pl, w_off, b_off, act;
+} p;
+
+const int K = 7, OX = 4, OY = 4, SPAN = OX + K - 1;
+
+void main() {
+    int g = invocation();
+    int bx = (p.ow + OX - 1) / OX, by = (p.oh + OY - 1) / OY;
+    if (g >= bx * by * p.c) return;
+    int ch = g % p.c, block = g / p.c;
+    int oy0 = (block / bx) * OY, ox0 = (block % bx) * OX;
+    float wk[K * K];
+    for (int i = 0; i < K * K; i++) wk[i] = w[p.w_off + i * p.c + ch];
+    float bias = p.b_off >= 0 ? w[p.b_off + ch] : 0.0;
+    float acc[OY][OX];
+    for (int r = 0; r < OY; r++) for (int o = 0; o < OX; o++) acc[r][o] = bias;
+    int left = ox0 - p.pl;
+    // Input row oy0 + i - pt is row ky = i - r of output row r's window.
+    for (int i = 0; i < OY + K - 1; i++) {
+        int iy = oy0 + i - p.pt;
+        if (iy < 0 || iy >= p.ih) continue;
+        float seg[SPAN];
+        for (int j = 0; j < SPAN; j++) {
+            int ix = left + j;
+            seg[j] = ix >= 0 && ix < p.iw ? x[(iy * p.iw + ix) * p.c + ch] : 0.0;
+        }
+        for (int r = 0; r < OY; r++) {
+            int ky = i - r;
+            if (ky < 0 || ky >= K) continue;
+            for (int kx = 0; kx < K; kx++)
+                for (int o = 0; o < OX; o++) acc[r][o] += seg[o + kx] * wk[ky * K + kx];
+        }
+    }
+    for (int r = 0; r < OY && oy0 + r < p.oh; r++)
+        for (int o = 0; o < OX && ox0 + o < p.ow; o++)
+            y[((oy0 + r) * p.ow + ox0 + o) * p.c + ch] = act(acc[r][o], p.act);
+}

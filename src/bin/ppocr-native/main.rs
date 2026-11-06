@@ -28,6 +28,9 @@
 //!   --threads N          threads the detector runs on, and recognisers working
 //!                        on a page's lines (default: the CPUs this process
 //!                        may use)
+//!   --gpu                run the networks on a Vulkan GPU, or on the CPU when
+//!                        there is none; boxes may then differ slightly from
+//!                        RapidOCR's
 //!   --detect-only        load the detector alone; only `detect` and
 //!                        `probmap` requests are answered
 //!   --box-thresh F       mean probability a box needs (0.5)
@@ -60,6 +63,7 @@ const DEFAULT_PLANS: &str = "/usr/share/ppocr-native";
 struct Args {
     persistent: bool,
     detect_only: bool,
+    gpu: bool,
     threads: usize,
     options: Options,
     images: Vec<PathBuf>,
@@ -78,7 +82,7 @@ fn main() -> ExitCode {
     let plans = std::env::var_os("PPOCR_NATIVE_PLANS")
         .map_or_else(|| PathBuf::from(DEFAULT_PLANS), PathBuf::from);
     let recognisers = if args.detect_only { 0 } else { args.threads };
-    let loaded = Reader::load(&plans, recognisers, args.threads, args.options);
+    let loaded = Reader::load(&plans, recognisers, args.threads, args.gpu, args.options);
     let result = match (loaded, args.persistent) {
         (Ok(mut reader), true) => serve(&mut reader),
         (Ok(mut reader), false) => {
@@ -109,6 +113,7 @@ fn parse(mut argv: impl Iterator<Item = OsString>) -> Result<Args, String> {
     let mut args = Args {
         persistent: false,
         detect_only: false,
+        gpu: false,
         threads: std::thread::available_parallelism().map_or(1, usize::from),
         options: Options {
             page: PageOptions::default(),
@@ -134,6 +139,7 @@ fn parse(mut argv: impl Iterator<Item = OsString>) -> Result<Args, String> {
         match name {
             "--persistent" => args.persistent = true,
             "--detect-only" => args.detect_only = true,
+            "--gpu" => args.gpu = true,
             "--full-resolution" => args.options.limit = Limit::Min(960),
             "--threads" => {
                 let text = value(name)?;

@@ -1,0 +1,31 @@
+#version 450
+// Pooling, one output value per invocation: `mode` 0 the maximum over the
+// window cut short at the bottom and right edges, 1 the average of a whole
+// window, its taps summed in row-major order.
+layout(local_size_x = 64) in;
+#include "act.glsl"
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform P {
+    int mode, ih, iw, c, oh, ow, kh, kw, sh, sw;
+} p;
+
+
+void main() {
+    int g = invocation();
+    if (g >= p.oh * p.ow * p.c) return;
+    int ch = g % p.c, pixel = g / p.c;
+    int oy = pixel / p.ow, ox = pixel % p.ow;
+    float acc = p.mode == 0 ? uintBitsToFloat(0xff800000u) : 0.0;
+    for (int ky = 0; ky < p.kh; ky++) {
+        int iy = oy * p.sh + ky;
+        if (iy >= p.ih) continue;
+        for (int kx = 0; kx < p.kw; kx++) {
+            int ix = ox * p.sw + kx;
+            if (ix >= p.iw) continue;
+            float v = x[(iy * p.iw + ix) * p.c + ch];
+            acc = p.mode == 0 ? (v > acc ? v : acc) : acc + v;
+        }
+    }
+    y[g] = p.mode == 0 ? acc : acc / float(p.kh * p.kw);
+}

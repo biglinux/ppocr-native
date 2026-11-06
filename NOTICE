@@ -6,7 +6,7 @@ work around them, provided under MIT OR Apache-2.0. The parts named in
 sections 2 and 3 are translated from OpenCV and Clipper source code and keep
 those licences, reproduced at the end of this file. Everything else
 reproduces the results of the projects below, measured by running them and
-from their documentation, or is credited in sections 6 and 7. Preserve
+from their documentation, or is credited in sections 6 to 8. Preserve
 LICENSE-MIT, LICENSE-APACHE and this notice.
 
 1. RapidOCR (Apache-2.0), whose PP-OCR pipeline defines the steps, their
@@ -60,7 +60,13 @@ LICENSE-MIT, LICENSE-APACHE and this notice.
    LLC. The folded sigmoid and the exponential under the softmax, GELU and
    swish compute as XNNPACK's f32-vsigmoid "p5-div" kernels do for finite
    values: the same constants, argument reduction and order of operations,
-   written anew in Rust. https://github.com/google/XNNPACK
+   written anew in Rust, and in GLSL for the GPU (shaders/act.glsl).
+   https://github.com/google/XNNPACK
+
+8. image-engine-native (MIT), by the same author: src/engine/gpu/ffi.rs and
+   src/engine/gpu/vk.rs, the Vulkan interface opened at run time, are
+   adapted from its native-vulkan crate.
+   https://github.com/biglinux/image-engine-native
 
 
 A. OpenCV 4.x, modules/imgproc/src/convhull.cpp

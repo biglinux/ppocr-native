@@ -1,0 +1,24 @@
+#version 450
+// (x - mean) / sqrt(var + eps) * gamma + beta over each pixel's c channels,
+// one pixel per invocation; w holds gamma, beta, then eps.
+layout(local_size_x = 64) in;
+#include "act.glsl"
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform P { int pixels, c, w_off; } p;
+
+
+void main() {
+    int px = invocation();
+    if (px >= p.pixels) return;
+    int at = px * p.c;
+    float mean = 0.0;
+    for (int i = 0; i < p.c; i++) mean += x[at + i];
+    mean /= float(p.c);
+    float var = 0.0;
+    for (int i = 0; i < p.c; i++) var += (x[at + i] - mean) * (x[at + i] - mean);
+    float r = sqrt(var / float(p.c) + w[p.w_off + 2 * p.c]);
+    for (int i = 0; i < p.c; i++)
+        y[at + i] = (x[at + i] - mean) / r * w[p.w_off + i] + w[p.w_off + p.c + i];
+}

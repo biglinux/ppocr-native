@@ -164,3 +164,36 @@ fn full_resolution_strip_stays_bounded() -> Result<()> {
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
+
+#[test]
+#[ignore = "needs PPOCR_NATIVE_PLANS and a Vulkan GPU"]
+fn gpu_worker_reads_as_cpu() -> Result<()> {
+    let plans = std::env::var_os("PPOCR_NATIVE_PLANS").ok_or("PPOCR_NATIVE_PLANS is not set")?;
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let dir = scratch_dir("gpu")?;
+    let page = Npy::read(&fixtures.join("page.npy"))?.image()?;
+    let path = dir.join("page.ppm");
+    write_ppm(&path, &page, page.width, page.height)?;
+    let read = |gpu: bool| -> Result<(Value, String)> {
+        let output = Command::new(env!("CARGO_BIN_EXE_ppocr-native"))
+            .args(["--threads", "2"])
+            .args(gpu.then_some("--gpu"))
+            .arg(&path)
+            .env("PPOCR_NATIVE_PLANS", &plans)
+            .output()?;
+        assert!(output.status.success());
+        let stderr = String::from_utf8(output.stderr)?;
+        Ok((serde_json::from_slice(&output.stdout)?, stderr))
+    };
+    let ((cpu, _), (gpu, stderr)) = (read(false)?, read(true)?);
+    assert!(
+        stderr.contains("ppocr-native: running on"),
+        "no GPU ran: {stderr}"
+    );
+    assert!(!stderr.contains("the GPU refused"), "{stderr}");
+    assert_eq!(gpu["txts"], cpu["txts"]);
+    let boxes = |page: &Value| page["boxes"].as_array().map(Vec::len);
+    assert_eq!(boxes(&gpu), boxes(&cpu));
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}

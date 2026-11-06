@@ -33,10 +33,12 @@
 //! run together and where each tensor lives; this file owns the memory and
 //! runs the steps; `conv.rs` (convolution, pooling) and `layers.rs` (the
 //! rest) compute whole layers with the tiered SIMD code in `kernels/`.
+//! [`GpuModel`] (`gpu/`) runs the same plans on a Vulkan GPU.
 
 #[macro_use]
 mod kernels;
 mod conv;
+mod gpu;
 mod layers;
 mod plan;
 mod schedule;
@@ -55,6 +57,7 @@ use conv::{
     add_with_tail, convolve, depthwise, maxpool, maxpool_in_place, opt, reads_windows,
     rows_per_group, Tail,
 };
+pub use gpu::GpuModel;
 pub use kernels::simd_tier;
 pub use plan::{Block, Error, Fused, Kind, Op};
 use plan::{Plan, MAX_SCRATCH_FLOATS};

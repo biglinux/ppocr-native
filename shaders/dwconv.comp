@@ -1,0 +1,44 @@
+#version 450
+// Depthwise convolution, weights [kh][kw][c], zero outside the image, then
+// the bias and the activation. An invocation computes OX horizontally
+// neighbouring outputs of one channel, reading each input row segment once
+// for all of them; neighbouring invocations take neighbouring channels.
+layout(local_size_x = 64) in;
+#include "act.glsl"
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform P {
+    int ih, iw, c, oh, ow, kh, kw, sh, sw, pt, pl, w_off, b_off, act;
+} p;
+
+const int OX = 4;
+// The widest row segment: OX outputs at stride 2 under a 7-wide kernel.
+const int SEG = (OX - 1) * 2 + 7;
+
+void main() {
+    int g = invocation();
+    int runs = (p.ow + OX - 1) / OX;
+    if (g >= p.oh * runs * p.c) return;
+    int ch = g % p.c, run = g / p.c;
+    int oy = run / runs, ox0 = (run - oy * runs) * OX;
+    float bias = p.b_off >= 0 ? w[p.b_off + ch] : 0.0;
+    float acc[OX];
+    for (int o = 0; o < OX; o++) acc[o] = bias;
+    int left = ox0 * p.sw - p.pl, span = (OX - 1) * p.sw + p.kw;
+    for (int ky = 0; ky < p.kh; ky++) {
+        int iy = oy * p.sh + ky - p.pt;
+        if (iy < 0 || iy >= p.ih) continue;
+        float seg[SEG];
+        for (int i = 0; i < span; i++) {
+            int ix = left + i;
+            seg[i] = ix >= 0 && ix < p.iw ? x[(iy * p.iw + ix) * p.c + ch] : 0.0;
+        }
+        for (int kx = 0; kx < p.kw; kx++) {
+            float wv = w[p.w_off + (ky * p.kw + kx) * p.c + ch];
+            for (int o = 0; o < OX; o++) acc[o] += seg[o * p.sw + kx] * wv;
+        }
+    }
+    for (int o = 0; o < OX && ox0 + o < p.ow; o++)
+        y[((oy * p.ow) + ox0 + o) * p.c + ch] = act(acc[o], p.act);
+}

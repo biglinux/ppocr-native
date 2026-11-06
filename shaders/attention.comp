@@ -1,0 +1,32 @@
+#version 450
+// Multi-head self-attention over the t pixels of a row, each holding
+// [q | k | v] of c values split into heads of hd: one invocation per query
+// and head, the softmax kept online over the keys.
+layout(local_size_x = 64) in;
+#include "act.glsl"
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform P { int t, c, heads, w_off; } p;
+
+void main() {
+    int g = invocation();
+    if (g >= p.t * p.heads) return;
+    int s = g / p.heads, h = g % p.heads, hd = p.c / p.heads;
+    float scale = w[p.w_off];
+    int q = s * 3 * p.c + h * hd;
+    float best = uintBitsToFloat(0xff800000u), sum = 0.0;
+    float acc[64];
+    for (int d = 0; d < hd; d++) acc[d] = 0.0;
+    for (int j = 0; j < p.t; j++) {
+        int k = j * 3 * p.c + p.c + h * hd;
+        float score = 0.0;
+        for (int d = 0; d < hd; d++) score += x[k + d] * (x[q + d] * scale);
+        float grown = max(best, score);
+        float shrink = exp_neg(best - grown), e = exp_neg(score - grown);
+        sum = sum * shrink + e;
+        for (int d = 0; d < hd; d++) acc[d] = acc[d] * shrink + e * x[k + p.c + d];
+        best = grown;
+    }
+    for (int d = 0; d < hd; d++) y[s * p.c + h * hd + d] = acc[d] / sum;
+}

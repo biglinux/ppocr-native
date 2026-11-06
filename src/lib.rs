@@ -52,7 +52,7 @@ use std::cmp::Ordering;
 mod contour;
 mod crop;
 mod det;
-#[allow(unsafe_code)] // SIMD kernels and scratch views; see each SAFETY comment
+#[allow(unsafe_code)] // SIMD kernels, scratch views and the Vulkan FFI; see each SAFETY comment
 pub mod engine;
 mod geometry;
 mod image;
