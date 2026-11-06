@@ -115,6 +115,7 @@ impl GpuModel {
         for (i, op) in plan.ops.iter().enumerate() {
             supported(op).map_err(|e| format!("operation {i}: {e}"))?;
         }
+        one_writer(&plan)?;
         let mut gpu = Gpu::open()?;
         let weights = gpu.buffer(values.len() * 4)?;
         let mut staging = gpu.host_buffer(values.len() * 4, false)?;
@@ -615,6 +616,19 @@ fn residual_gate(ops: &[Op], reads: &[usize], m: usize) -> bool {
         })
 }
 
+/// `GpuModel::arrange` gives each buffer of the plan one place on the GPU
+/// for the whole run, so a buffer written twice would be read where its
+/// last writer left it. The exporter writes each buffer once.
+fn one_writer(plan: &Plan) -> Result<(), String> {
+    let mut written = vec![false; plan.pool.len()];
+    for (i, op) in plan.ops.iter().enumerate() {
+        if std::mem::replace(&mut written[op.y], true) {
+            return Err(format!("operation {i} writes buffer {} again", op.y));
+        }
+    }
+    Ok(())
+}
+
 /// Why `op` cannot run on the GPU, if it cannot.
 fn supported(op: &Op) -> Result<(), String> {
     let fused = matches!(
@@ -1047,4 +1061,29 @@ fn floats_mut(bytes: &mut [u8]) -> &mut [f32] {
     assert!(bytes.as_ptr().cast::<f32>().is_aligned());
     // SAFETY: as for `floats`, and the borrow is unique.
     unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast(), bytes.len() / 4) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::plan::{encode, op, Kind, Plan};
+    use super::one_writer;
+
+    #[test]
+    fn rewritten_buffer_is_refused() {
+        let plan = |last_y| {
+            let mut ops = [
+                op(Kind::Add, 0, 1, 3, 3),
+                op(Kind::Add, 1, 2, 3, 3),
+                op(Kind::Add, 2, last_y, 3, 3),
+            ];
+            for op in &mut ops {
+                op.x2 = op.x;
+            }
+            Plan::parse(&encode((0, 2, 2, 3), 4, &[last_y], &ops, &[]))
+                .unwrap()
+                .0
+        };
+        assert!(one_writer(&plan(3)).is_ok());
+        assert!(one_writer(&plan(1)).is_err());
+    }
 }
