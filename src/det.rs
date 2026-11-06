@@ -1,6 +1,8 @@
 //! Everything around the DB text detector: the page sizes it is fed, its input
 //! tensor, and the boxes read back from its probability map.
 
+use std::sync::{Mutex, PoisonError};
+
 use crate::contour::{contour_mean, find_contours};
 use crate::geometry::{mini_box, unclip, Quad};
 use crate::image::{resize_linear, resize_linear_rows, Image};
@@ -240,29 +242,49 @@ pub fn det_input_hwc(
     });
     let row = width * 3;
     let band = height.div_ceil(threads.max(1)) * row;
-    let table = &table;
+    // Band `i` of the image, into `out`.
+    let fill = |i: usize, out: &mut [f32]| {
+        let first = i * band / row;
+        let mut bytes = vec![0; out.len()];
+        resize_linear_rows(
+            image,
+            width,
+            height,
+            first..first + out.len() / row,
+            &mut bytes,
+        );
+        for (out, px) in out
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .zip(bytes.as_chunks::<3>().0)
+        {
+            *out = std::array::from_fn(|c| table[c][usize::from(px[c])]);
+        }
+    };
+    let mut bands = out[..height * row].chunks_mut(band).enumerate();
+    let Some((_, first)) = bands.next() else {
+        return;
+    };
+    // The calling thread takes the first band, and any band whose thread
+    // the system refuses to start.
+    let bands: Vec<_> = bands.map(|(i, out)| (i, Mutex::new(Some(out)))).collect();
     std::thread::scope(|scope| {
-        for (i, out) in out[..height * row].chunks_mut(band).enumerate() {
-            scope.spawn(move || {
-                let first = i * band / row;
-                let mut bytes = vec![0; out.len()];
-                resize_linear_rows(
-                    image,
-                    width,
-                    height,
-                    first..first + out.len() / row,
-                    &mut bytes,
-                );
-                for (out, px) in out
-                    .as_chunks_mut::<3>()
-                    .0
-                    .iter_mut()
-                    .zip(bytes.as_chunks::<3>().0)
-                {
-                    *out = std::array::from_fn(|c| table[c][usize::from(px[c])]);
+        let fill = &fill;
+        for (i, out) in &bands {
+            let take = || out.lock().unwrap_or_else(PoisonError::into_inner).take();
+            let started = std::thread::Builder::new().spawn_scoped(scope, move || {
+                if let Some(out) = take() {
+                    fill(*i, out);
                 }
             });
+            if started.is_err() {
+                if let Some(out) = take() {
+                    fill(*i, out);
+                }
+            }
         }
+        fill(0, first);
     });
 }
 
