@@ -897,10 +897,13 @@ fn choose(instance: &Instance) -> Result<Choice, String> {
             rejected.push(format!("{name}: Vulkan older than 1.2"));
             continue;
         }
-        // The matrix and CTC shaders run 256 invocations a workgroup; Vulkan
-        // only promises 128.
-        if props.limits.max_compute_work_group_invocations < 256 {
-            rejected.push(format!("{name}: fewer than 256 invocations a workgroup"));
+        // The matrix and CTC shaders run 256 invocations a workgroup, all
+        // along x; Vulkan only promises 128.
+        let limits = &props.limits;
+        if limits.max_compute_work_group_invocations < 256
+            || limits.max_compute_work_group_size[0] < 256
+        {
+            rejected.push(format!("{name}: workgroups narrower than 256 invocations"));
             continue;
         }
         // SAFETY: the two-call enumeration again.
