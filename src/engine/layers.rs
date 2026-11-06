@@ -10,6 +10,8 @@
 //! hold them. `exp` is `kernels::exp_neg`; GELU's normal distribution
 //! function is a rational fit (absolute error 7e-9 before rounding).
 
+use std::ops::Range;
+
 use super::kernels::{self, exp_neg, madd};
 #[cfg(target_arch = "x86_64")]
 use super::kernels::{exp2_bits_avx, exp2_bits_avx2, exp2_bits_sse, simd_tier};
@@ -620,14 +622,19 @@ impl Transposed<'_> {
         }
     }
 
-    /// The layer, each pair of its output rows handed straight to `next`,
-    /// which writes `y`: the map between never leaves the cache.
+    /// Input rows `inputs` of the layer, each pair of its output rows handed
+    /// straight to `next`, which writes them to `y`, the rows those input
+    /// rows give: the map between never leaves the cache. Each input row's
+    /// output rows are its own, so bands of input rows can run on separate
+    /// threads.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_into(
         &self,
         next: &Self,
         x: &[f32],
         y: &mut [f32],
         scratch: &mut [f32],
+        inputs: Range<usize>,
         finish: &dyn Fn(&mut [f32]),
         finish_next: &dyn Fn(&mut [f32]),
     ) {
@@ -636,11 +643,12 @@ impl Transposed<'_> {
         let (rows, rest) = rest.split_at_mut(op.kh * op.ow * op.oc);
         let next_blocks = &mut rest[..transpose_scratch(after)];
         let next_rows = after.kh * after.ow * after.oc;
-        for iy in 0..op.ih {
+        let first = inputs.start;
+        for iy in inputs {
             let src = &x[iy * op.iw * op.ic..][..op.iw * op.ic];
             self.row(src, rows, blocks, finish);
             for (r, row) in rows.chunks_exact(op.ow * op.oc).enumerate() {
-                let out = &mut y[(iy * op.kh + r) * next_rows..][..next_rows];
+                let out = &mut y[((iy - first) * op.kh + r) * next_rows..][..next_rows];
                 next.row(row, out, next_blocks, finish_next);
             }
         }
