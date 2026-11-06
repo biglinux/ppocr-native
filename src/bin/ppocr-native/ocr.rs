@@ -8,9 +8,9 @@ use std::thread;
 
 use ppocr_native::engine::{Kind, Model};
 use ppocr_native::{
-    boxes_from_prob, crop_text, ctc_decode, det_input, det_size, fit_page, is_blank, page_lines,
-    prepare_page, rec_input, to_page, DbOptions, Dictionary, Image, Limit, Line, PageOptions,
-    PreparedPage, Quad, REC_HEIGHT, VERTICAL_ASPECT_RATIO,
+    boxes_from_prob, crop_text, ctc_decode, det_input_hwc, det_size, fit_page, is_blank,
+    page_lines, prepare_page, rec_input, to_page, DbOptions, Dictionary, Image, Limit, Line,
+    PageOptions, PreparedPage, Quad, REC_HEIGHT, VERTICAL_ASPECT_RATIO,
 };
 
 pub const DET_PLAN: &str = "PP-OCRv6_det_small.plan";
@@ -46,6 +46,7 @@ pub struct Page {
 
 pub struct Reader {
     det: Model,
+    det_threads: usize,
     /// One recogniser per thread, sharing their weights; none when the
     /// reader only detects.
     rec: Vec<Model>,
@@ -99,6 +100,7 @@ impl Reader {
         }
         Ok(Self {
             det,
+            det_threads: det_threads.max(1),
             rec,
             dictionary,
             options,
@@ -127,12 +129,16 @@ impl Reader {
         else {
             return Ok(None);
         };
-        let chw = det_input(fitted, w, h, MEAN, STD);
         self.det.set_input_size(h, w).map_err(|e| e.to_string())?;
-        let plane = w * h;
-        for (i, v) in self.det.input_mut().iter_mut().enumerate() {
-            *v = chw[(i % 3) * plane + i / 3];
-        }
+        det_input_hwc(
+            fitted,
+            w,
+            h,
+            MEAN,
+            STD,
+            self.det_threads,
+            self.det.input_mut(),
+        );
         self.det.run();
         let boxes = boxes_from_prob(
             self.det.output(0),
